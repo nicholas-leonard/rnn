@@ -236,6 +236,13 @@ function AbstractRecurrent:maxBPTTstep(rho)
    self.rho = rho
 end
 
+-- used by Recursor() after calling stepClone.
+-- this solves a very annoying bug...
+function AbstractRecurrent:setOutputStep(step)
+   self.output = self.outputs[step]
+   assert(self.output)
+end
+
 -- backwards compatibility
 AbstractRecurrent.recursiveResizeAs = rnn.recursiveResizeAs
 AbstractRecurrent.recursiveSet = rnn.recursiveSet

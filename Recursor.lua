@@ -54,6 +54,7 @@ function Recursor:backwardThroughTime(timeStep, timeRho)
       for step=timeStep-1,math.max(stop, 1),-1 do
          -- backward propagate through this step
          local recurrentModule = self:getStepModule(step)
+         recurrentModule:setOutputStep(step)
          gradInput = recurrentModule:backward(self.inputs[step], self.gradOutputs[step] , self.scales[step])
          table.insert(self.gradInputs, 1, gradInput)
       end
@@ -76,6 +77,7 @@ function Recursor:updateGradInputThroughTime(timeStep, rho)
    for step=timeStep-1,math.max(stop,1),-1 do
       -- backward propagate through this step
       local recurrentModule = self:getStepModule(step)
+      recurrentModule:setOutputStep(step)
       gradInput = recurrentModule:updateGradInput(self.inputs[step], self.gradOutputs[step])
       table.insert(self.gradInputs, 1, gradInput)
    end
@@ -104,6 +106,7 @@ function Recursor:accUpdateGradParametersThroughTime(lr, timeStep, rho)
    for step=timeStep-1,math.max(stop,1),-1 do
       -- backward propagate through this step
       local recurrentModule = self:getStepModule(step)
+      recurrentModule:setOutputStep(step)
       recurrentModule:accUpdateGradParameters(self.inputs[step], self.gradOutputs[step], lr*self.scales[step])
    end
    
