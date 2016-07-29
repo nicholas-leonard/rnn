@@ -34,6 +34,12 @@ function AbstractRecurrent:getStepModule(step)
    return recurrentModule
 end
 
+-- empty the sharedClones table keeping only the recurrentModule
+function AbstractRecurrent:clearStepModules()
+   self:forget() -- compacts sharedclones
+   self.sharedClones = {self.recurrentModule}
+end
+
 function AbstractRecurrent:maskZero(nInputDim)
    self.recurrentModule = nn.MaskZero(self.recurrentModule, nInputDim, true)
    self.sharedClones = {self.recurrentModule}
