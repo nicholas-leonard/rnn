@@ -5514,6 +5514,7 @@ function rnntest.SeqLSTMP_main()
    local paramsp, gradParamsp = lstmp:parameters()
    
    mytester:assert(#params + 1 == #paramsp)
+   mytester:assert(math.abs(paramsp[3]:sum()) > 0.000001)
    
    for i=1,#params do
       paramsp[i]:copy(params[i])

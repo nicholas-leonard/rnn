@@ -1,5 +1,6 @@
 require 'paths'
 require 'rnn'
+require 'optim'
 local dl = require 'dataload'
 
 --[[ command line arguments ]]--
@@ -22,8 +23,8 @@ cmd:option('--earlystop', 50, 'maximum number of epochs to wait to find a better
 cmd:option('--progress', false, 'print progress bar')
 cmd:option('--silent', false, 'don\'t print anything to stdout')
 cmd:option('--uniform', 0.1, 'initialize parameters using uniform distribution between -uniform and uniform. -1 means default initialization')
--- pretrained recurrent neural network language model
-cmd:option('--xplogpath', '', 'path to the pretrained RNNLM that will be used to initialize the GAN')
+-- rnn
+cmd:option('--xplogpath', '', 'path to the pretrained RNNLM that is used to initialize the GAN')
 cmd:option('--nsample', 100, 'how may words to sample from the bigram distribution')
 cmd:option('--k', 1, 'number of discriminator updates per generator update')
 cmd:option('--dhiddensize', '{}', 'table of discriminator hidden sizes')
@@ -95,7 +96,16 @@ table.insert(gsm.modules, 1, lookup:sharedClone())
 
 -- LSRC requires output of bigrams
 local lsrc = nn.LSRC(1,1):fromLinear(linear)
-local bigram = nn.Bigrams(opt.nsample)
+
+local cachepath = paths.concat(opt.savepath, 'ptb.t7')
+local bigram 
+if paths.filep(opt.cachepath) then
+   bigram = torch.load(bigram)
+else
+   local bigrams = dl.buildBigrams(trainset)
+   bigram = nn.Bigrams(bigrams, opt.nsample)
+   torch.save(opt.cachepath, bigram)
+end
 
 gsm = nn.Sequential()
    :add(nn.ConcatTable():add(gsm):add(bigram))
@@ -182,13 +192,12 @@ xplog.d_net = nn.Serial(d_net); xplog.d_net:mediumSerial()
 xplog.dg_net = nn.Serial(dg_net); xplog.dg_net:mediumSerial()
 xplog.d_criterion = d_criterion
 -- keep a log of error for each epoch
-xplog.dgerr = {}
-xplog.derr = {}
-xplog.dgacc = {}
-xplog.dacc = {}
+xplog.dgerr, xplog.derr = {}, {}
+xplog.accuracy, xplog.confusion = {}, {}
 xplog.epoch = 0
 paths.mkdir(opt.savepath)
--- confusion matrices
+
+-- confusion matrix
 function optim.ConfusionMatrix:batchAddBCE(predictions, targets)
    self._bcepred = self._bcepred or predictions.new()
    self._bcepred:gt(predictions, 0.5):add(1)
@@ -196,7 +205,6 @@ function optim.ConfusionMatrix:batchAddBCE(predictions, targets)
    self._bcetarg:add(targets, 1)
    return self:batchAdd(self._bcepred, self._bcetarg)
 end
-xplog.cm = optim.ConfusionMatrix{0,1}
 
 --[[ training loop ]]--
 
@@ -215,9 +223,11 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    print("Epoch #"..epoch.." :")
    
    local a = torch.Timer()
-   lm:training()
+   dg_net:training()
+   d_net:training()
    local sum_dg_err, sum_d_err = 0, 0
    local dg_count, d_count = 0, 0
+   local cm = optim.ConfusionMatrix{0,1}
    local k = 0
    for i, inputs, targets in trainset:subiter(opt.seqlen, opt.trainsize) do -- x ~ Pdata(x)
       -- 1.1 train discriminator D()
@@ -239,7 +249,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
       local d_gradOutput = d_criterion:backward(dg_output, d_target)
       dg_net:backward(z, dg_gradOutput)
       
-      xplog.cm:batchAddBCE(dg_output, d_target)
+      cm:batchAddBCE(dg_output, d_target)
       
       -- D(x) : forward/backward x through discriminator network
       local d_output = d_net:forward(inputs)
@@ -251,7 +261,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
       d_net:zeroGradParameters()
       d_net:backward(inputs, d_gradOutput)
       
-      xplog.cm:batchAddBCE(d_output, d_target)
+      cm:batchAddBCE(d_output, d_target)
       
       -- update D(G(z))
       if opt.cutoff > 0 then
@@ -279,7 +289,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          dg_net:get(1):zeroGradParameters()
          dg_net:get(2):dontBackward()
          local dg_output = dg_net:forward(z)
-         local dg_err = d_criterion:forward(dg_output)
+         local dg_err = d_criterion:forward(dg_output) -- TODO : reinforce criterion
          sum_dg_err = sum_dg_err + dg_err
          dg_count = dg_count + 1
          
@@ -287,7 +297,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          local dg_gradOutput = d_criterion:backward(dg_output, d_target)
          dg_net:backward(z, dg_gradOutput)
          
-         xplog.cm:batchAddBCE(dg_output, d_target)
+         cm:batchAddBCE(dg_output, d_target)
          
          -- update D(G(z))
          if opt.cutoff > 0 then
@@ -321,14 +331,16 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    end
 
    if cutorch then cutorch.synchronize() end
-   local speed = a:time().real/opt.trainsize
-   print(string.format("Speed : %f sec/batch ", speed))
+   local speed = opt.trainsize*opt.batchsize/a:time().real
+   print(string.format("Speed : %f words/second; %f ms/word", speed, 1000/speed))
 
    xplog.dgerr[epoch] = sum_dg_err/dg_count
    xplog.derr[epoch] = sum_d_err/d_count
    print(string.format("Training Err: D(x)=%f, D(G(z))=%f", xplog.derr[epoch], xplog.dgerr[epoch))
    
-   print(xplog.cm)
+   print(cm)
+   xplog.accuracy[epoch] = cm.totalValids
+   xplog.confusion[epoch] = cm
 
 end
 

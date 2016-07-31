@@ -237,8 +237,8 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    end
 
    if cutorch then cutorch.synchronize() end
-   local speed = a:time().real/opt.trainsize
-   print(string.format("Speed : %f sec/batch ", speed))
+   local speed = opt.trainsize*opt.batchsize/a:time().real
+   print(string.format("Speed : %f words/second; %f ms/word", speed, 1000/speed))
 
    local ppl = torch.exp(sumErr/opt.trainsize)
    print("Training PPL : "..ppl)
