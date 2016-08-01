@@ -47,6 +47,7 @@ torch.include('rnn', 'Sequencer.lua')
 torch.include('rnn', 'BiSequencer.lua')
 torch.include('rnn', 'BiSequencerLM.lua')
 torch.include('rnn', 'RecurrentAttention.lua')
+torch.include('rnn', 'SequenceGenerator.lua')
 
 -- sequencer + recurrent modules
 torch.include('rnn', 'SeqLSTM.lua')

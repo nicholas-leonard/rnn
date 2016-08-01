@@ -6674,6 +6674,79 @@ function rnntest.inplaceBackward()
    end
 end
 
+function rnntest.SequenceGenerator()
+   local ngen = 3
+   local seqlen = 2
+   local batchsize = 5
+   local hiddensize = 2 -- input and output size must match
+   
+   local rnn = nn.FastLSTM(hiddensize, hiddensize)
+   local sg = nn.SequenceGenerator(rnn:clone(), ngen)
+   
+   local input = torch.randn(seqlen, batchsize, hiddensize)
+   
+   -- test training
+   local output2 = torch.zeros(ngen, batchsize, hiddensize)
+   for i=1,seqlen do
+      output2[1] = rnn:forward(input[i])
+   end
+   for i=2,ngen do
+      output2[i] = rnn:forward(output2[i-1])
+   end
+   
+   local output = sg:forward(input)
+   
+   mytester:assertTensorEq(output, output2, 0.000001)
+   
+   -- test evaluation
+   sg:evaluate()
+   sg:forget()
+   
+   local output = sg:forward(input)
+   mytester:assertTensorEq(output, output2, 0.000001)
+   
+   -- test forward/backward
+   sg:training()
+   sg:forget()
+   
+   local gradOutput = torch.randn(ngen, batchsize, hiddensize)
+   
+   local output = sg:forward(input)
+   sg:zeroGradParameters()
+   local gradInput = sg:backward(input, gradOutput)
+   
+   rnn:forget()
+   local output2 = torch.zeros(ngen, batchsize, hiddensize)
+   for i=1,seqlen do
+      output2[1] = rnn:forward(input[i])
+   end
+   for i=2,ngen do
+      output2[i] = rnn:forward(output2[i-1])
+   end
+   
+   rnn:zeroGradParameters()
+   local gradInput2 = input:clone():zero()
+   for i=ngen,2,-1 do
+      rnn:backward(output2[i-1], gradOutput[i])
+   end
+   gradInput2[seqlen] = rnn:backward(input[seqlen], gradOutput[1])
+   local gradZero = gradOutput[1]:clone():zero()
+   for i=seqlen-1,1,-1 do
+      gradInput2[i] = rnn:backward(input[i], gradZero)
+   end
+   
+   mytester:assertTensorEq(output, output2, 0.000001)
+   mytester:assertTensorEq(gradInput, gradInput2, 0.000001)
+   
+   local params, gradParams = sg:parameters()
+   local params2, gradParams2 = rnn:parameters()
+   
+   for i=1,#params do
+      mytester:assertTensorEq(gradParams[i], gradParams2[i], 0.000001)
+      mytester:assert(math.abs(gradParams[i]:sum()) > 0.001)
+   end
+end
+
 function rnn.test(tests, benchmark_)
    mytester = torch.Tester()
    benchmark = benchmark_

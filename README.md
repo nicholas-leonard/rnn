@@ -25,7 +25,8 @@ Modules that `forward` entire sequences through a decorated `AbstractRecurrent` 
  * [BiSequencerLM](#rnn.BiSequencerLM) : used for implementing Bidirectional RNNs and LSTMs for language models;
  * [Repeater](#rnn.Repeater) : repeatedly applies the same input to an AbstractRecurrent instance;
  * [RecurrentAttention](#rnn.RecurrentAttention) : a generalized attention model for [REINFORCE modules](https://github.com/nicholas-leonard/dpnn#nn.Reinforce);
-
+ * [SequenceGenerator](#rnn.SequenceGenerator) : recursively generate an `output` sequence given an `input` sequence. Used for sampling sequences;
+ 
 Miscellaneous modules and criterions :
  * [MaskZero](#rnn.MaskZero) : zeroes the `output` and `gradOutput` rows of the decorated module for commensurate `input` rows which are tensors of zeros;
  * [TrimZero](#rnn.TrimZero) : same behavior as `MaskZero`, but more efficient when `input` contains lots zero-masked rows;
@@ -1007,6 +1008,37 @@ Therefore, the `action` module's outputs are only used internally, within the Re
 to generate the zero Tensor to sample an action for the first step (see above).
 
 A complete implementation of Ref. A is available [here](examples/recurrent-visual-attention.lua).
+
+<a name='rnn.SequenceGenerator'></a>
+## SequenceGenerator ##
+
+```lua
+seqgen = nn.SequenceGenerator(rnn, ngen)
+``` 
+An [AbstractSequencer](#rnn.AbstractSequencer) subclass, the `SequenceGenerator` can be used to recursively generate sequences.
+Suppose you have an `rnn` (an [AbstractRecurrent](#rnn.AbstractRecurrent) subclass) for which you want to feed in a 
+an `input` of size `seqlen x batchsize x hiddensize` to then generate an `output` of size `ngen x batchsize x hiddensize`.
+The `input` is used to condition the `rnn`:
+
+```lua
+local output = torch.zeros(ngen, batchsize, hiddensize)
+for i=1,seqlen do
+   output[1] = rnn:forward(input[i])
+end
+``` 
+The above only considers the last output of the `rnn` as this is the first of `ngen` generated outputs (i.e. `output[1]`). 
+For the remaining `ngen-1` outputs, we feed the last `output[i-1]` into the `rnn`:
+
+```lua
+for i=2,ngen do
+   output[i] = rnn:forward(output[i-1])
+end
+``` 
+
+This is exactly what the `SequenceGenerator` does when we call `forward`.
+
+When calling `backward`, backpropagation through time occurs for `ngen+seqlen-1` time-steps (which is the exact mount of times `rnn:forward()` is called above).
+The returned `gradInput` is only for the provided `input` tensor, which is of size `seqlen x batchsize x hiddensize`.
 
 <a name='rnn.MaskZero'></a>
 ## MaskZero ##
