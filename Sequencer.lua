@@ -1,8 +1,8 @@
 ------------------------------------------------------------------------
 --[[ Sequencer ]]--
 -- Encapsulates a Module. 
--- Input is a sequence (a table) of tensors.
--- Output is a sequence (a table) of tensors of the same length.
+-- Input is a sequence (a table or tensor) of tensors.
+-- Output is a sequence of tensors of the same length.
 -- Applies the module to each element in the sequence.
 -- Handles both recurrent modules and non-recurrent modules.
 -- The sequences in a batch must have the same size.
