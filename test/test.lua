@@ -6747,6 +6747,118 @@ function rnntest.SequenceGenerator()
    end
 end
 
+function rnntest.rnn_sharedClone()
+   -- test that sharedClone works on Abstract[Recurrent|Sequencer]
+   local T, N, H = 3, 4, 5
+   local input = torch.randn(T,N,H)
+   local gradOutput = torch.randn(T,N,H)
+   
+   local function testrnn(rnn, rnn2)
+      local output = torch.zeros(T,N,H)
+      local output2 = torch.zeros(T,N,H)
+      
+      for i=1,T do
+         output[i] = rnn:forward(input[i])
+         output2[i] = rnn2:forward(input[i])
+      end
+      
+      mytester:assertTensorEq(output, output2, 0.000001)
+      
+      local gradInput = torch.zeros(T,N,H)
+      local gradInput2 = torch.zeros(T,N,H)
+      rnn:zeroGradParameters()
+      rnn2:zeroGradParameters()
+      for i=T,1,-1 do
+         gradInput[i] = rnn:backward(input[i], gradOutput[i])
+      end
+   
+      local params, gradParams = rnn:parameters()
+      local params2, gradParams2 = rnn2:parameters()
+      
+      local gpc = {}
+      for i=1,#params do
+         mytester:assertTensorEq(gradParams[i], gradParams2[i], 0.000001)
+         gpc[i] = torch.mul(gradParams[i], 2)
+      end
+      
+      for i=T,1,-1 do
+         gradInput2[i] = rnn2:backward(input[i], gradOutput[i])
+      end
+      
+      mytester:assertTensorEq(gradInput, gradInput2, 0.000001)
+      
+      for i=1,#params do
+         mytester:assertTensorEq(gpc[i], gradParams2[i], 0.000001)
+      end
+   end
+   
+   -- test AbstractRecurrent:sharedClone()
+   local rnn = nn.FastLSTM(H,H)
+   local rnn2 = rnn:sharedClone()
+   testrnn(rnn, rnn2)
+   
+   rnn:forget(); rnn2:forget()
+   testrnn(rnn, rnn2)
+   
+   local rnn = nn.Recursor(nn.Sequential():add(nn.FastLSTM(H,H)):add(nn.FastLSTM(H,H)))
+   local rnn2 = rnn:sharedClone()
+   testrnn(rnn, rnn2)
+   
+   rnn:forget(); rnn2:forget()
+   testrnn(rnn, rnn2)
+
+   local function testrnn(rnn, rnn2)
+      local output = rnn:forward(input)
+      local output2 = rnn2:forward(input)
+      
+      mytester:assertTensorEq(output, output2, 0.000001)
+      
+      rnn:zeroGradParameters()
+      rnn2:zeroGradParameters()
+      
+      local gradInput = rnn:backward(input, gradOutput)
+      
+      local params, gradParams = rnn:parameters()
+      local params2, gradParams2 = rnn2:parameters()
+      
+      local gpc = {}
+      for i=1,#params do
+         mytester:assertTensorEq(gradParams[i], gradParams2[i], 0.000001)
+         gpc[i] = torch.mul(gradParams[i], 2)
+      end
+      
+      local gradInput2 = rnn2:backward(input, gradOutput)
+      
+      mytester:assertTensorEq(gradInput, gradInput2, 0.000001)
+      
+      for i=1,#params do
+         mytester:assertTensorEq(gpc[i], gradParams2[i], 0.000001)
+      end
+   end
+   
+   -- test AbstractSequencer:sharedClone()
+   local rnn = nn.Sequencer(nn.FastLSTM(H,H))
+   local rnn2 = rnn:sharedClone()
+   testrnn(rnn, rnn2)
+   
+   rnn:forget(); rnn2:forget()
+   testrnn(rnn, rnn2)
+   
+   local rnn = nn.Sequencer(nn.Sequential():add(nn.FastLSTM(H,H)):add(nn.FastLSTM(H,H)))
+   local rnn2 = rnn:sharedClone()
+   testrnn(rnn, rnn2)
+   
+   rnn:forget(); rnn2:forget()
+   testrnn(rnn, rnn2)
+   
+   local rnn = nn.SeqLSTM(H,H)
+   local rnn2 = rnn:sharedClone()
+   testrnn(rnn, rnn2)
+   
+   rnn:forget(); rnn2:forget()
+   testrnn(rnn, rnn2)
+end
+
 function rnn.test(tests, benchmark_)
    mytester = torch.Tester()
    benchmark = benchmark_
