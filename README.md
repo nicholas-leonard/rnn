@@ -1036,6 +1036,7 @@ end
 ``` 
 
 This is exactly what the `SequenceGenerator` does when we call `forward`.
+Because the outputs are fed back in as inputs, the `output` and `input` to the `rnn` must both have the same `hiddensize`.
 
 When calling `backward`, backpropagation through time occurs for `ngen+seqlen-1` time-steps (which is the exact mount of times `rnn:forward()` is called above).
 The returned `gradInput` is only for the provided `input` tensor, which is of size `seqlen x batchsize x hiddensize`.

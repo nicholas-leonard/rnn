@@ -5,11 +5,8 @@ local dl = require 'dataload'
 
 --[[
 TODO
-test rnn:sharedClone
 test cuda LSRC
-SeqGen (backward, test train/eval)
 Bigrams
-GARNNReward
 feed condition into D()
 --]]
 
@@ -39,6 +36,7 @@ cmd:option('--nsample', 100, 'how may words w[t+1] to sample from the bigram dis
 cmd:option('--k', 1, 'number of discriminator updates per generator update')
 cmd:option('--ngen', 50, 'number of words generated per update')
 cmd:option('--dhiddensize', '{}', 'table of discriminator hidden sizes')
+cmd:option('--depoch', 2, 'how many epochs to train the discriminator for before beginning to train generator')
 -- data
 cmd:option('--batchsize', 32, 'number of examples per batch')
 cmd:option('--trainsize', -1, 'number of train examples seen between each epoch')
@@ -173,7 +171,10 @@ dg_net = nn.Sequential() -- D(G(z))
 
 --[[ loss function ]]--
 
-local g_criterion = nn.GANReward()
+local g_criterion = nn.BinaryClassReward()
+-- add the baseline reward predictor
+local basereward = nn.Add(1)
+local b_zero = torch.zeros(opt.batchsize, 1)
 
 -- -log(1-D(G(z)))
 local d_criterion = nn.BCECriterion()
@@ -187,6 +188,8 @@ if opt.cuda then
    criterion:cuda()
    d_criterion:cuda()
    d_target = d_target:cuda()
+   basereward:cuda()
+   b_zero:cuda()
 end
 
 --[[ experiment log ]]--
@@ -288,7 +291,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
       d_net:updateGradParameters(opt.momentum)
       d_net:updateParameters(opt.lr)
       
-      if k == opt.k then 
+      if epoch > opt.depoch and k == opt.k then 
          -- train generator G(z)
          k = 0
          
@@ -300,13 +303,20 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          dg_net:get(1):zeroGradParameters()
          dg_net:get(2):dontBackward()
          local dg_output = dg_net:forward(z)
-         local dg_err = d_criterion:forward(dg_output) -- TODO : reinforce criterion
+         
+         -- get baseline reward for REINFORCE criterion
+         local br = basereward:forward(b_zero)
+         -- reward=1 for classifying gen. sample. as training data, i.e.
+         -- reward G(z) when D(G(z)) gets fooled into thinking it sees D(x)
+         d_target:resize(opt.batchsize):fill(1) 
+         local dg_err = g_criterion:forward({dg_output, br}, d_target) 
          sum_dg_err = sum_dg_err + dg_err
          dg_count = dg_count + 1
          
          d_target:resize(opt.batchsize):fill(0)
-         local dg_gradOutput = d_criterion:backward(dg_output, d_target)
-         dg_net:backward(z, dg_gradOutput)
+         local dg_gradOutput = g_criterion:backward({dg_output, br}, d_target)
+         dg_net:backward(z, dg_gradOutput[1])
+         basereward:backward(b_zero, dg_gradOutput[2])
          
          cm:batchAddBCE(dg_output, d_target)
          
@@ -316,6 +326,10 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          end
          dg_net:get(1):updateGradParameters(opt.momentum)
          dg_net:get(1):updateParameters(opt.lr)
+         
+         -- update baseline reward
+         dg_net:get(1):updateGradParameters(opt.momentum)
+         basereward:updateParameters(opt.lr)
          
       end
 
