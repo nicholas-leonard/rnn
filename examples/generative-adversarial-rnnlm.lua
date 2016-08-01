@@ -3,6 +3,16 @@ require 'rnn'
 require 'optim'
 local dl = require 'dataload'
 
+--[[
+TODO
+test rnn:sharedClone
+test cuda LSRC
+SeqGen (backward, test train/eval)
+Bigrams
+GARNNReward
+feed condition into D()
+--]]
+
 --[[ command line arguments ]]--
 cmd = torch.CmdLine()
 cmd:text()
@@ -25,8 +35,9 @@ cmd:option('--silent', false, 'don\'t print anything to stdout')
 cmd:option('--uniform', 0.1, 'initialize parameters using uniform distribution between -uniform and uniform. -1 means default initialization')
 -- rnn
 cmd:option('--xplogpath', '', 'path to the pretrained RNNLM that is used to initialize the GAN')
-cmd:option('--nsample', 100, 'how may words to sample from the bigram distribution')
+cmd:option('--nsample', 100, 'how may words w[t+1] to sample from the bigram distribution given w[t]')
 cmd:option('--k', 1, 'number of discriminator updates per generator update')
+cmd:option('--ngen', 50, 'number of words generated per update')
 cmd:option('--dhiddensize', '{}', 'table of discriminator hidden sizes')
 -- data
 cmd:option('--batchsize', 32, 'number of examples per batch')
@@ -111,7 +122,7 @@ gsm = nn.Sequential()
    :add(nn.ConcatTable():add(gsm):add(bigram))
    :add(lsrc)
 
-local g_net = nn.SequenceGenerator(gsm) -- G(z)
+local g_net = nn.SequenceGenerator(gsm, opt.ngen) -- G(z)
 print("Generator Network")
 print(g_net)
 
@@ -229,7 +240,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    local dg_count, d_count = 0, 0
    local cm = optim.ConfusionMatrix{0,1}
    local k = 0
-   for i, inputs, targets in trainset:subiter(opt.seqlen, opt.trainsize) do -- x ~ Pdata(x)
+   for i, inputs, targets in trainset:subiter(opt.ngen, opt.trainsize) do -- x ~ Pdata(x)
       -- 1.1 train discriminator D()
       k = k + 1
       
@@ -309,7 +320,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
       end
 
       if opt.progress then
-         xlua.progress(math.min(i + opt.seqlen, opt.trainsize), opt.trainsize)
+         xlua.progress(math.min(i + opt.ngen, opt.trainsize), opt.trainsize)
       end
 
       if i % 1000 == 0 then
