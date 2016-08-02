@@ -1,11 +1,11 @@
 require 'paths'
 require 'rnn'
 require 'optim'
+require 'nngraph'
 local dl = require 'dataload'
 
 --[[
 TODO
-test cuda LSRC
 Bigrams
 feed condition into D()
 --]]
@@ -73,16 +73,17 @@ end
 
 local xplog = torch.load(opt.xplogpath)
 assert(xplog.dataset == 'PennTreeBank', "GAN-RNNLM currently only supports LMs trained with recurrent-language-model.lua script")
-local lm = torch.type(xplog.model) == 'nn.Serial' and lm.modules[1] or lm
+local lm = torch.type(xplog.model) == 'nn.Serial' and xplog.model.modules[1] or xplog.model
 
 print("Loaded language model")
 print(lm)
+print""
 
 -- clear all sharedClones
 lm:clearStepModules()
 
 -- get pre-trained word embedding space
-local lookuptable = assert(lm:findModules('nn.Lookuptable')[1], 'Missing LookupTable')
+local lookuptable = assert(lm:findModules('nn.LookupTable')[1], 'Missing LookupTable')
 
 -- get sequencer containing the stepmodule (rnn stack that is applied to every time-step)
 local sequencer = assert(lm:findModules('nn.Sequencer')[1], 'Missing Sequencer')
@@ -101,12 +102,13 @@ local gsm = stepmodule:sharedClone()
 if lm:get(2) == 'nn.Dropout' then
    table.insert(gsm.modules, 1, nn.Dropout())
 end
-table.insert(gsm.modules, 1, lookup:sharedClone())
+table.insert(gsm.modules, 1, lookuptable:sharedClone())
 
 -- LSRC requires output of bigrams
 local lsrc = nn.LSRC(1,1):fromLinear(linear)
 
 local cachepath = paths.concat(opt.savepath, 'ptb.t7')
+--[[
 local bigram 
 if paths.filep(opt.cachepath) then
    bigram = torch.load(bigram)
@@ -115,14 +117,24 @@ else
    bigram = nn.Bigrams(bigrams, opt.nsample)
    torch.save(opt.cachepath, bigram)
 end
+--]]
+local bigram = nn.Replicate(opt.nsample,2):type('torch.LongTensor')
+
+if opt.cuda then
+   bigram = nn.DontCast(bigram, true, true)
+end
 
 gsm = nn.Sequential()
    :add(nn.ConcatTable():add(gsm):add(bigram))
    :add(lsrc)
 
-local g_net = nn.SequenceGenerator(gsm, opt.ngen) -- G(z)
-print("Generator Network")
+local g_net = nn.Sequential() -- G(z)
+   :add(nn.Convert())
+   :add(nn.SequenceGenerator(gsm, opt.ngen))
+   
+print("Generator Network: G(z)")
 print(g_net)
+print""
 
 local gupdateGradInput = g_net.updateGradInput
 local gaccGradParameters = g_net.accGradParameters
@@ -138,7 +150,7 @@ local dsm = stepmodule:clone() -- the rnns layers of g_net and d_net are not sha
 if lm:get(2) == 'nn.Dropout' then
    table.insert(dsm.modules, 1, nn.Dropout())
 end
-table.insert(dsm.modules, 1, lookup:sharedClone()) -- lookuptables are shared
+table.insert(dsm.modules, 1, lookuptable:sharedClone()) -- lookuptables are shared
 
 -- the last hidden state is used to discriminate the entire sequence
 local d_net = nn.Sequential() -- D(x)
@@ -146,7 +158,7 @@ local d_net = nn.Sequential() -- D(x)
    :add(nn.Select(1,-1))
 
 local inputsize = lsrc.inputsize
-for i, hiddensize in ipairs(opt.dhiddensize)
+for i, hiddensize in ipairs(opt.dhiddensize) do
    d_net:add(nn.Linear(inputsize, hiddensize))
    d_net:add(nn.Tanh())
    inputsize = hiddensize
@@ -163,15 +175,23 @@ function d_net:dontBackward()
    self.accGradParameters = function() end
 end
 
+print("Discriminator Network: D(x)")
+print(d_net)
+print""
+
 --[[ discriminator of generative samples : D(G(z)) ]]--
 
 dg_net = nn.Sequential() -- D(G(z))
    :add(g_net)
    :add(d_net:sharedClone())
+   
+print("Disc. Generator Network: D(G(z))")
+print(dg_net)
+print""
 
 --[[ loss function ]]--
 
-local g_criterion = nn.BinaryClassReward()
+local g_criterion = nn.BinaryClassReward(dg_net)
 -- add the baseline reward predictor
 local basereward = nn.Add(1)
 local b_zero = torch.zeros(opt.batchsize, 1)
@@ -183,13 +203,16 @@ local d_target = torch.Tensor()
 --[[ CUDA ]]--
 
 if opt.cuda then
+   a = torch.Timer()
    g_net:cuda()
    d_net:cuda()
-   criterion:cuda()
+   dg_net:cuda()
    d_criterion:cuda()
+   g_criterion:cuda()
    d_target = d_target:cuda()
    basereward:cuda()
    b_zero:cuda()
+   print("converted to cuda in "..a:time().real.."s")
 end
 
 --[[ experiment log ]]--
@@ -206,7 +229,7 @@ xplog.d_net = nn.Serial(d_net); xplog.d_net:mediumSerial()
 xplog.dg_net = nn.Serial(dg_net); xplog.dg_net:mediumSerial()
 xplog.d_criterion = d_criterion
 -- keep a log of error for each epoch
-xplog.dgerr, xplog.derr = {}, {}
+xplog.dgerr, xplog.derr, xplog.gerr = {}, {}, {}
 xplog.accuracy, xplog.confusion = {}, {}
 xplog.epoch = 0
 paths.mkdir(opt.savepath)
@@ -223,9 +246,13 @@ end
 --[[ training loop ]]--
 
 -- Pg(z) is the unigram distribution
-trainset.unigrams:div(trainset.unigrams:sum())
-local Pgen = torch.AliasMultinomial(trainset.unigrams)
-local z = torch.LongTensor(opt.batchsize)
+trainset.unigram = torch.Tensor(#trainset.ivocab)
+for i,word in ipairs(trainset.ivocab) do
+   trainset.unigram[i] = trainset.wordfreq[word]
+end
+trainset.unigram:div(trainset.unigram:sum())
+local Pgen = torch.AliasMultinomial(trainset.unigram)
+local z = torch.LongTensor(1, opt.batchsize)
 
 local epoch = 1
 
@@ -239,8 +266,8 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    local a = torch.Timer()
    dg_net:training()
    d_net:training()
-   local sum_dg_err, sum_d_err = 0, 0
-   local dg_count, d_count = 0, 0
+   local sum_dg_err, sum_d_err, sum_g_err = 0, 0, 0
+   local dg_count, d_count, g_count = 0, 0, 0
    local cm = optim.ConfusionMatrix{0,1}
    local k = 0
    for i, inputs, targets in trainset:subiter(opt.ngen, opt.trainsize) do -- x ~ Pdata(x)
@@ -255,25 +282,28 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
       dg_net:get(2):doBackward()
       dg_net:get(2):zeroGradParameters()
       local dg_output = dg_net:forward(z)
-      local dg_err = d_criterion:forward(dg_output)
+      
+      d_target:resize(opt.batchsize):fill(0)
+      local dg_err = d_criterion:forward(dg_output, d_target)
       sum_dg_err = sum_dg_err + dg_err
       dg_count = dg_count + 1
       
-      d_target:resize(opt.batchsize):fill(0)
-      local d_gradOutput = d_criterion:backward(dg_output, d_target)
-      dg_net:backward(z, dg_gradOutput)
+      local gradOutput = d_criterion:backward(dg_output, d_target)
+      dg_net:backward(z, gradOutput)
       
       cm:batchAddBCE(dg_output, d_target)
       
       -- D(x) : forward/backward x through discriminator network
       local d_output = d_net:forward(inputs)
-      local d_err = d_criterion:forward(d_output, d_target:fill(1))
+      
+      d_target:fill(1)
+      local d_err = d_criterion:forward(d_output, d_target)
       sum_d_err = sum_d_err + d_err
       d_count = d_count + 1
       
-      local d_gradOutput = d_criterion:backward(d_output, d_target)
+      local gradOutput = d_criterion:backward(d_output, d_target)
       d_net:zeroGradParameters()
-      d_net:backward(inputs, d_gradOutput)
+      d_net:backward(inputs, gradOutput)
       
       cm:batchAddBCE(d_output, d_target)
       
@@ -308,16 +338,16 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          local br = basereward:forward(b_zero)
          -- reward=1 for classifying gen. sample. as training data, i.e.
          -- reward G(z) when D(G(z)) gets fooled into thinking it sees D(x)
-         d_target:resize(opt.batchsize):fill(1) 
-         local dg_err = g_criterion:forward({dg_output, br}, d_target) 
-         sum_dg_err = sum_dg_err + dg_err
-         dg_count = dg_count + 1
+         d_target:fill(1) 
+         local g_err = g_criterion:forward({dg_output, br}, d_target) 
+         sum_g_err = sum_g_err + g_err
+         g_count = g_count + 1
+   
+         local gradOutput = g_criterion:backward({dg_output, br}, d_target)
+         dg_net:backward(z, gradOutput[1])
+         basereward:backward(b_zero, gradOutput[2])
          
          d_target:resize(opt.batchsize):fill(0)
-         local dg_gradOutput = g_criterion:backward({dg_output, br}, d_target)
-         dg_net:backward(z, dg_gradOutput[1])
-         basereward:backward(b_zero, dg_gradOutput[2])
-         
          cm:batchAddBCE(dg_output, d_target)
          
          -- update D(G(z))
@@ -357,11 +387,12 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
 
    if cutorch then cutorch.synchronize() end
    local speed = opt.trainsize*opt.batchsize/a:time().real
-   print(string.format("Speed : %f words/second; %f ms/word", speed, 1000/speed))
+   print(string.format("Speed : %f train-words/second; %f ms/word", speed, 1000/speed))
 
    xplog.dgerr[epoch] = sum_dg_err/dg_count
    xplog.derr[epoch] = sum_d_err/d_count
-   print(string.format("Training Err: D(x)=%f, D(G(z))=%f", xplog.derr[epoch], xplog.dgerr[epoch))
+   xplog.gerr[epoch] = sum_g_err/g_count
+   print(string.format("Training Err: D(x)=%f, D(G(z))=%f, G(z)=%f", xplog.derr[epoch], xplog.dgerr[epoch], xplog.gerr[epoch]))
    
    print(cm)
    xplog.accuracy[epoch] = cm.totalValids

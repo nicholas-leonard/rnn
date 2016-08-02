@@ -20,6 +20,16 @@ function Module:remember(remember)
    return self
 end
 
+-- used by AbstractRecurrent instances
+function Module:clearStepModules()
+   if self.modules then
+      for i, module in ipairs(self.modules) do
+         module:clearStepModules()
+      end
+   end
+   return self
+end
+
 function Module:stepClone(shareParams, shareGradParams)
    return self:sharedClone(shareParams, shareGradParams, true)
 end
