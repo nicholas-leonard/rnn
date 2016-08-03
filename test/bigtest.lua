@@ -114,6 +114,86 @@ function rnnbigtest.NCE_nan()
    
 end
 
+function rnnbigtest.SG_LSRC_BCR()
+   local nindex = 10
+   local inputsize = 4
+   local seqlen = 1
+   local batchsize = 3
+   local ngen = 10
+   
+   local input = torch.LongTensor(seqlen, batchsize)
+   local target = torch.LongTensor(batchsize):fill(1)
+   local _output = torch.Tensor(batchsize)
+   
+   local lookup = nn.LookupTable(nindex, inputsize)
+   local linear = nn.LSRC(inputsize, nindex)
+   
+   local index = torch.LongTensor(nindex):range(1,nindex)
+   local prob = torch.FloatTensor(nindex):fill(1/nindex)
+   local bigrams = {}
+   for i=1,nindex do
+      bigrams[i] = {index = index, prob = prob}
+   end
+   
+   local bigram = nn.Bigrams(bigrams, 10)
+   
+   local stepmodule = nn.Sequential()
+      :add(nn.ConcatTable():type('torch.LongTensor'):add(lookup):add(bigram))
+      :add(linear)
+   
+   local sg = nn.SequenceGenerator(stepmodule, ngen)
+   
+   local bcr = nn.BinaryClassReward(sg)
+   local basereward = nn.Add(1)
+   local b_zero = torch.zeros(batchsize, 1)
+   
+   for epoch = 1, 20 do
+      local meanreward = 0
+      for k=1,20 do
+         input:random(1,nindex)
+         
+         local output = sg:forward(input)
+         
+         -- reward is 1 when index 1, 2 or 3 are present, 0 otherwise
+         _output:zero()
+         for i=1,batchsize do
+            local f1, f2, f3
+            output[i]:apply(function(x) 
+               if x == 1 then
+                  f1 = true
+               elseif x == 2 then
+                  f2 = true
+               elseif x == 3 then
+                  f3 = true
+               end
+            end)
+            if f1 or f2 or f3 then
+               _output[i] = 1
+            end
+         end
+         
+         meanreward = meanreward + _output:mean()
+        
+         local br = basereward:forward(b_zero)
+        
+         local err = bcr:forward({_output, br}, target)
+         
+         local gradOutput = bcr:backward({_output, br}, target)
+         
+         sg:zeroGradParameters()
+         basereward:zeroGradParameters()
+         
+         sg:backward(input,  output)
+         basereward:backward(b_zero, gradOutput[2])
+         
+         sg:updateParameters(0.1)
+         basereward:updateParameters(0.1)
+      end
+      
+      print("Epoch="..epoch..", reward="..meanreward/20)
+   end
+end
+
 function rnn.bigtest(tests)
    mytester = torch.Tester()
    mytester:add(rnnbigtest)
