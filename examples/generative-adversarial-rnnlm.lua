@@ -16,8 +16,15 @@ TODO
 feed condition into D()
 std reward
 D() reward at each time-step
-savefreq 
-print samples
+reduce discriminator capacity
+
+issue:
+generator gets stuck in local minima by REINFORCE
+solutions:
+e-greedy, temperature, train LM
+condition on trainset samples
+decrease size of training set samples when generator gets better.
+
 --]]
 
 --[[ command line arguments ]]--
@@ -48,6 +55,11 @@ cmd:option('--evalfreq', 10, 'how many updates between evaluations')
 cmd:option('--updatelookup', false, 'set to true to enable lookup table updates')
 cmd:option('--dreward', false, 'reward = D(G(z))')
 cmd:option('--rewardscale', 1, 'the scale of the reward.')
+cmd:option('--fixgen', false, 'fix the generator (dont let it learn)')
+cmd:option('--epsilon', 0, 'epsilon greedy value defaults to 0.1/nsample')
+cmd:option('--savefreq', 3, 'save model every savefreq epochs')
+cmd:option('--traincond', false, 'use the training set to condition the G(z), i.e. z~P_data(x)')
+cmd:option('--smoothtarget', false, 'discriminator targets are 0.1 and 0.9 instead of 0 and 1')
 -- data
 cmd:option('--batchsize', 32, 'number of examples per batch')
 cmd:option('--trainsize', -1, 'number of train examples seen between each epoch')
@@ -60,11 +72,12 @@ assert(opt.xplogpath ~= '' and paths.filep(opt.xplogpath), "Expecting pre-traine
 opt.dhiddensize = loadstring(" return "..opt.dhiddensize)()
 opt.schedule = loadstring(" return "..opt.schedule)()
 opt.inputsize = opt.inputsize == -1 and opt.hiddensize[1] or opt.inputsize
+opt.id = opt.id == '' and ('ptb' .. ':' .. dl.uniqueid()) or opt.id
+opt.version = 4 -- trainset is used as z; disc. sees cond and gen: D(z..G(z))
+opt.epsilon = opt.epsilon == -1 and 0.1/opt.nsample or opt.epsilon
 if not opt.silent then
    table.print(opt)
 end
-opt.id = opt.id == '' and ('ptb' .. ':' .. dl.uniqueid()) or opt.id
-opt.version = 2 -- prob of training gen is proportional to disc accuracy
 
 if opt.cuda then
    require 'cunn'
@@ -136,7 +149,7 @@ if paths.filep(opt.cachepath) then
    bigram = torch.load(opt.cachepath)
 else
    local bigrams = dl.buildBigrams(trainset)
-   bigram = nn.Bigrams(bigrams, opt.nsample)
+   bigram = nn.Bigrams(bigrams, opt.nsample, opt.epsilon)
    torch.save(opt.cachepath, bigram)
 end
 print("Mean bigram size: "..bigram:statistics())
@@ -149,27 +162,14 @@ gsm = nn.Sequential()
    :add(nn.ConcatTable():add(gsm):add(bigram))
    :add(lsrc)
 
+local seqgen = nn.SequenceGenerator(gsm, opt.ngen)
 local g_net = nn.Sequential() -- G(z)
    :add(nn.Convert())
-   :add(nn.SequenceGenerator(gsm, opt.ngen))
+   :add(seqgen)
    
 print("Generator Network: G(z)")
 print(g_net)
 print""
-
-local gupdateGradInput = g_net.updateGradInput
-local gaccGradParameters = g_net.accGradParameters
-function g_net:doBackward()
-   self.updateGradInput = gupdateGradInput
-   self.accGradParameters = gaccGradParameters
-end
-function g_net:dontBackward()
-   self.updateGradInput = function() end
-   self.accGradParameters = function() end
-   self.accUpdateGradParameters = function() end
-   return self
-end
-
 
 --[[ discriminator network : D(x) ]]--
 
@@ -196,41 +196,30 @@ end
 d_net:add(nn.Linear(inputsize, 1))
 d_net:add(nn.Sigmoid())
 
-local daccGradParameters = d_net.accGradParameters
-function d_net:doBackward()
-   self.accGradParameters = daccGradParameters
-end
-function d_net:dontBackward()
-   self.accGradParameters = function() end
-end
-
 print("Discriminator Network: D(x)")
 print(d_net)
 print""
 
+if opt.cuda then
+   d_net:cuda()
+   g_net:cuda()
+end
 
 --[[ discriminator of generative samples : D(G(z)) ]]--
 
-local _d_net = d_net:sharedClone()
-local dg_net = nn.Sequential() -- D(G(z))
-   :add(g_net)
-   :add(_d_net)
-   
-local _daccGradParameters = _d_net.accGradParameters
-function _d_net:doBackward()
-   self.accGradParameters = _daccGradParameters
+local dg_net = d_net:sharedClone()
+
+local daccGradParameters = dg_net.accGradParameters
+function dg_net:doBackward()
+   self.accGradParameters = daccGradParameters
 end
-function _d_net:dontBackward()
+function dg_net:dontBackward()
    self.accGradParameters = function() end
 end
    
-print("Disc. Generator Network: D(G(z))")
-print(dg_net)
-print""
-
 --[[ loss function ]]--
 
-local g_criterion = nn.BinaryClassReward(dg_net, opt.rewardscale)
+local g_criterion = nn.BinaryClassReward(g_net, opt.rewardscale)
 -- add the baseline reward predictor
 local basereward = nn.Add(1)
 local b_zero = torch.zeros(opt.batchsize, 1)
@@ -242,15 +231,11 @@ local d_target = torch.Tensor()
 --[[ CUDA ]]--
 
 if opt.cuda then
-   a = torch.Timer()
-   d_net:cuda()
-   dg_net:cuda()
    d_criterion:cuda()
    g_criterion:cuda()
    d_target = d_target:cuda()
    basereward:cuda()
    b_zero = b_zero:cuda()
-   print("converted to cuda in "..a:time().real.."s")
 end
 
 --[[ experiment log ]]--
@@ -293,6 +278,19 @@ trainset.unigram:div(trainset.unigram:sum())
 local Pgen = torch.AliasMultinomial(trainset.unigram)
 local z = torch.LongTensor(1, opt.batchsize)
 
+-- z ~ Pg(z) : sample some words to condition the generator
+local function drawPgen(z)
+   if opt.traincond then
+      opt.ncond = opt.ncond or opt.ngen
+      local cond = trainset.data:narrow(1, math.random(1, trainset:size(1)-opt.ncond), opt.ncond)
+      z:resize(opt.ncond, opt.batchsize):copy(cond)
+      seqgen.ngen = opt.ngen-opt.ncond+1
+   else
+      z = Pgen:batchdraw(z)
+   end
+   return z
+end
+
 local epoch = 1
 local evalcount = 0 
 local p_train_gen = 0.5 -- prob of training generator instead of discriminator
@@ -306,46 +304,56 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    local a = torch.Timer()
    dg_net:training()
    d_net:training()
+   g_net:training()
    local sum_dg_err, sum_d_err, sum_g_err = 0.0000001, 0.0000001, 0.0000001
    local dg_count, d_count, g_count = 0, 0, 0
    local cm = optim.ConfusionMatrix{0,1}
    
-
-   for i, inputs, targets in trainset:subiter(opt.ngen, opt.trainsize) do -- x ~ Pdata(x)
+   for i, inputs, targets in trainset:subiter(opt.ngen+1, opt.trainsize) do -- x ~ Pdata(x)
       
-      if evalcount <= 0 or math.random() > p_train_gen then
+      if opt.fixgen or evalcount <= 0 or math.random() > p_train_gen then
          -- train or evaluate discriminator D()
          
-         -- z ~ Pg(z) : sample some words to condition the generator
-         z = Pgen:batchdraw(z)
+         z = drawPgen(z)
          
          -- D(G(z)) : forward/backward z through disc. generator network
-         dg_net:get(1):dontBackward()
-         dg_net:get(2):doBackward()
-         dg_net:get(2):zeroGradParameters()
-         local dg_output = dg_net:forward(z)
+         local g_output = g_net:forward(z)
          
-         d_target:resize(opt.batchsize):fill(0)
+         -- input to discriminator is concatenation of z and g_output
+         d_input = d_input or g_output.new()
+         d_input:resize(g_output:size(1)+z:size(1), opt.batchsize)
+         d_input:narrow(1,1,z:size(1)):copy(z)
+         d_input:narrow(1,z:size(1)+1,g_output:size(1)):copy(g_output)
+         
+         dg_net:training()
+         dg_net:forget()
+         local dg_output = dg_net:forward(d_input)
+         
+         d_target:resize(opt.batchsize):fill(opt.smoothtarget and 0.1 or 0)
          local dg_err = d_criterion:forward(dg_output, d_target)
          
          if evalcount <= 0 then
+            d_target:fill(0)
             cm:batchAddBCE(dg_output, d_target)
          else
             sum_dg_err = sum_dg_err + dg_err
             dg_count = dg_count + 1
             
             local gradOutput = d_criterion:backward(dg_output, d_target)
-            dg_net:backward(z, gradOutput)
+            dg_net:zeroGradParameters()
+            dg_net:doBackward()
+            dg_net:backward(d_input, gradOutput)
          end
          
          -- D(x) : forward/backward x through discriminator network
          local d_output = d_net:forward(inputs)
          
-         d_target:fill(1)
+         d_target:fill(opt.smoothtarget and 0.9 or 1)
          local d_err = d_criterion:forward(d_output, d_target)
          
          
          if evalcount <= 0 then
+            d_target:fill(1)
             cm:batchAddBCE(d_output, d_target)
             evalcount = opt.evalfreq + 1
             cm:updateValids()
@@ -355,37 +363,45 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
             sum_d_err = sum_d_err + d_err
             d_count = d_count + 1
             
+            -- backward D(x)
             local gradOutput = d_criterion:backward(d_output, d_target)
-            d_net:zeroGradParameters()
             d_net:backward(inputs, gradOutput)
             
-            
-            -- update D(G(z))
-            if opt.cutoff > 0 then
-               dg_net:get(2):gradParamClip(opt.cutoff)
-            end
-            dg_net:get(2):updateGradParameters(opt.momentum)
-            dg_net:get(2):updateParameters(opt.lr)
-            
-            -- update D(x)
+            -- update D(x) and D(G(z))
             if opt.cutoff > 0 then
                d_net:gradParamClip(opt.cutoff)
             end
             d_net:updateGradParameters(opt.momentum)
             d_net:updateParameters(opt.lr)
+            
+            if not tested_grad_d then
+               local p, gp = d_net:parameters()
+               local p2, gp2 = dg_net:parameters()
+               for i=1,#p do
+                  assert(math.abs(p[i]:sum() - p2[i]:sum()) < 0.000001)
+                  assert(math.abs(gp[i]:sum() - gp2[i]:sum()) < 0.000001)
+               end
+               print"TESTED"
+               tested_grad_d = true
+            end
          end
          
       else
          -- train generator G(z)
          
          -- z ~ Pg(z) : sample some words to condition the generator
-         z = Pgen:batchdraw(z)
+         z = drawPgen(z)
       
          -- D(G(z)) : forward/backward z through disc. generator network
-         dg_net:get(1):doBackward()
-         dg_net:get(1):zeroGradParameters()
-         dg_net:get(2):dontBackward()
-         local dg_output = dg_net:forward(z)[{{},1}]
+         local g_output = g_net:forward(z)
+          
+         -- input to discriminator is concatenation of z and g_output
+         d_input = d_input or g_output.new()
+         d_input:resize(g_output:size(1)+z:size(1), opt.batchsize)
+         d_input:narrow(1,1,z:size(1)):copy(z)
+         d_input:narrow(1,z:size(1)+1,g_output:size(1)):copy(g_output)
+         
+         local dg_output = dg_net:forward(d_input)[{{},1}]
          
          -- get baseline reward for REINFORCE criterion
          local br = basereward:forward(b_zero)
@@ -410,7 +426,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
             xplog.mse.vrReward:div(opt.batchsize)
             
             -- broadcast reward to modules
-            dg_net:reinforce(xplog.mse.vrReward)  
+            g_net:reinforce(xplog.mse.vrReward)  
             
             -- zero gradInput (this criterion has no gradInput for class pred)
             xplog.mse._gradZero = xplog.mse._gradZero or dg_output.new()
@@ -422,7 +438,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
             xplog.mse:forward(br, xplog.mse.reward)
             gradOutput[2] = xplog.mse:backward(br, xplog.mse.reward)
          else
-            -- reward=1 for classifying gen. sample. as training data, i.e.
+            -- reward=1 for classifying gen. sample. as training data
             d_target:fill(1) 
             g_err = g_criterion:forward({dg_output, br}, d_target) 
             gradOutput = g_criterion:backward({dg_output, br}, d_target)
@@ -431,19 +447,18 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          sum_g_err = sum_g_err + g_err
          g_count = g_count + 1
    
-         dg_net:zeroGradParameters()
-         dg_net:backward(z, gradOutput[1])
+         g_net:zeroGradParameters()
+         g_net:backward(z, g_output) -- g_output is ignored
          basereward:zeroGradParameters()
          basereward:backward(b_zero, gradOutput[2])
          
-         d_target:resize(opt.batchsize):fill(0)
          
          -- update D(G(z))
          if opt.cutoff > 0 then
-            dg_net:get(1):gradParamClip(opt.cutoff)
+            g_net:gradParamClip(opt.cutoff)
          end
-         dg_net:get(1):updateGradParameters(opt.momentum)
-         dg_net:get(1):updateParameters(opt.lr)
+         g_net:updateGradParameters(opt.momentum)
+         g_net:updateParameters(opt.lr)
          
          -- update baseline reward
          basereward:updateGradParameters(opt.momentum)
@@ -454,7 +469,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
       evalcount = evalcount - 1
 
       if opt.progress then
-         xlua.progress(math.min(i + opt.ngen, opt.trainsize), opt.trainsize)
+         xlua.progress(math.min(i + opt.ngen + 1, opt.trainsize), opt.trainsize)
       end
 
       if i % 1000 == 0 then
@@ -489,9 +504,31 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    print(cm)
    xplog.accuracy[epoch] = cm.totalValid
    xplog.confusion[epoch] = cm
+   
+   if opt.ncond and cm.totalValid < 0.6 then
+      opt.ncond = math.max(1, opt.ncond - 1)
+      print("Decreasing size of condition z to "..opt.ncond)
+   end
+   -- draw a sample
+   g_net:evaluate()
 
-   print("saving model at "..paths.concat(opt.savepath, opt.id..'.t7'))
-   torch.save(paths.concat(opt.savepath, opt.id..'.t7'), xplog)
+   local given = 'never'
+   local sampletext = {given}
+   seqgen.ngen = opt.ngen
+   local input = opt.cuda and torch.CudaTensor(1,1) or torch.LongTensor(1,1) -- seqlen x batchsize
+   input[{1,1}] = trainset.vocab[given]
+   local output = g_net:forward(input)
+
+   for i=1,output:size(1) do
+      table.insert(sampletext, trainset.ivocab[output[i][1]])
+   end
+   print"generated sample:"
+   print(table.concat(sampletext, ' '))
+
+   if epoch % opt.savefreq == 0 then
+      print("saving model at "..paths.concat(opt.savepath, opt.id..'.t7'))
+      torch.save(paths.concat(opt.savepath, opt.id..'.t7'), xplog)
+   end
    epoch = epoch + 1
 end
 
