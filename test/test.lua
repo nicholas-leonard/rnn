@@ -6681,17 +6681,22 @@ function rnntest.SequenceGenerator()
    local hiddensize = 2 -- input and output size must match
    
    local rnn = nn.FastLSTM(hiddensize, hiddensize)
-   local sg = nn.SequenceGenerator(rnn:clone(), ngen)
+   local gen = nn.FastLSTM(hiddensize, hiddensize)
+   
+   local sg = nn.SequenceGenerator(rnn:clone(), gen:clone(), ngen)
    
    local input = torch.randn(seqlen, batchsize, hiddensize)
    
    -- test training
    local output2 = torch.zeros(ngen, batchsize, hiddensize)
+   local hidden = {}
    for i=1,seqlen do
-      output2[1] = rnn:forward(input[i])
+     hidden[1] = rnn:forward(input[i])
    end
+   output2[1] = gen:forward(hidden[1])
    for i=2,ngen do
-      output2[i] = rnn:forward(output2[i-1])
+      hidden[i] = rnn:forward(output2[i-1])
+      output2[i] = gen:forward(hidden[i])
    end
    
    local output = sg:forward(input)
@@ -6705,6 +6710,7 @@ function rnntest.SequenceGenerator()
    local output = sg:forward(input)
    mytester:assertTensorEq(output, output2, 0.000001)
    
+   
    -- test forward/backward
    sg:training()
    sg:forget()
@@ -6716,21 +6722,30 @@ function rnntest.SequenceGenerator()
    local gradInput = sg:backward(input, gradOutput)
    
    rnn:forget()
+   gen:forget()
    local output2 = torch.zeros(ngen, batchsize, hiddensize)
+   local hidden = {}
    for i=1,seqlen do
-      output2[1] = rnn:forward(input[i])
+     hidden[1] = rnn:forward(input[i])
    end
+   output2[1] = gen:forward(hidden[1])
    for i=2,ngen do
-      output2[i] = rnn:forward(output2[i-1])
+      hidden[i] = rnn:forward(output2[i-1])
+      output2[i] = gen:forward(hidden[i])
    end
    
    rnn:zeroGradParameters()
+   gen:zeroGradParameters()
    local gradInput2 = input:clone():zero()
-   for i=ngen,2,-1 do
-      rnn:backward(output2[i-1], gradOutput[i])
+   local gradHidden = {}
+   for i=ngen,1,-1 do
+      gradHidden[i] = gen:backward(hidden[i], gradOutput[i])
+      if i > 1 then
+         rnn:backward(output2[i-1], gradHidden[i])
+      end
    end
-   gradInput2[seqlen] = rnn:backward(input[seqlen], gradOutput[1])
-   local gradZero = gradOutput[1]:clone():zero()
+   gradInput2[seqlen] = rnn:backward(input[seqlen], gradHidden[1])
+   local gradZero = gradHidden[1]:clone():zero()
    for i=seqlen-1,1,-1 do
       gradInput2[i] = rnn:backward(input[i], gradZero)
    end
@@ -6739,7 +6754,7 @@ function rnntest.SequenceGenerator()
    mytester:assertTensorEq(gradInput, gradInput2, 0.000001)
    
    local params, gradParams = sg:parameters()
-   local params2, gradParams2 = rnn:parameters()
+   local params2, gradParams2 = nn.Container():add(rnn):add(gen):parameters()
    
    for i=1,#params do
       mytester:assertTensorEq(gradParams[i], gradParams2[i], 0.000001)

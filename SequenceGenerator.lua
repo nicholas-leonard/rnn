@@ -14,19 +14,24 @@ local _ = require 'moses'
 SequenceGenerator.dpnn_mediumEmpty = _.clone(nn.Module.dpnn_mediumEmpty)
 table.insert(SequenceGenerator.dpnn_mediumEmpty, '_output')
 
-function SequenceGenerator:__init(rnn, ngen)
+function SequenceGenerator:__init(rnn, gen, ngen)
    parent.__init(self)
    if not torch.isTypeOf(rnn, 'nn.Module') then
       error"SequenceGenerator: expecting nn.Module instance at arg 1"
+   end
+   if not torch.isTypeOf(gen, 'nn.Module') then
+      error"SequenceGenerator: expecting nn.Module instance at arg 2"
    end
    
    assert(torch.type(ngen) == 'number')
    self.ngen = ngen
    
    -- we can decorate the module with a Recursor to make it AbstractRecurrent
-   self.module = (not torch.isTypeOf(rnn, 'nn.AbstractRecurrent')) and nn.Recursor(rnn) or rnn
-   self.modules = {self.module}
+   rnn = (not torch.isTypeOf(rnn, 'nn.AbstractRecurrent')) and nn.Recursor(rnn) or rnn
+   gen = (not torch.isTypeOf(gen, 'nn.AbstractRecurrent')) and nn.Recursor(gen) or gen
+   self.modules = {rnn, gen}
    
+   self.hidden = {}
    self.output = {}
    self.tableoutput = {}
    self.tablegradInput = {}
@@ -47,23 +52,31 @@ function SequenceGenerator:updateOutput(input)
       seqlen = #input
    end
 
-   self.module:maxBPTTstep(seqlen+self.ngen-1)
+   local rnn, gen = unpack(self.modules)
+   rnn:maxBPTTstep(seqlen+self.ngen-1)
+   gen:maxBPTTstep(self.ngen)
    
    if self.train ~= false then 
       -- TRAINING
       if not (self._remember == 'train' or self._remember == 'both') then
-         self.module:forget()
+         rnn:forget()
+         gen:forget()
       end
       
       -- condition the generator (forward the input through the module)
-      self.tableoutput = {}
+      self.hidden = {}
       for step=1,seqlen do
-         self.tableoutput[1] = self.module:updateOutput(input[step])
+         self.hidden[1] = rnn:updateOutput(input[step])
       end
       
+      self.tableoutput = {}
+      
       -- generate sequence (forward generated outputs as input, and so on)
-      for step=2,self.ngen do
-         self.tableoutput[step] = self.module:updateOutput(self.tableoutput[step-1])
+      for step=1,self.ngen do
+         if step > 1 then
+            self.hidden[step] = rnn:updateOutput(self.tableoutput[step-1])
+         end
+         self.tableoutput[step] = gen:updateOutput(self.hidden[step])
       end
       
       if torch.isTensor(input) then
@@ -78,14 +91,17 @@ function SequenceGenerator:updateOutput(input)
    else 
       -- EVALUATION
       if not (self._remember == 'eval' or self._remember == 'both') then
-         self.module:forget()
+         rnn:forget()
+         gen:forget()
       end
       
       -- condition
-      local output
+      local hidden
       for step=1,seqlen do
-         output = self.module:updateOutput(input[step])
+         hidden = rnn:updateOutput(input[step])
       end
+      
+      local output = gen:updateOutput(hidden)
          
       -- during evaluation, recurrent modules reuse memory (i.e. outputs)
       -- so we need to copy each output into our own table or tensor
@@ -97,21 +113,22 @@ function SequenceGenerator:updateOutput(input)
          
          -- generate
          for step=2,self.ngen do
-            output = self.module:updateOutput(output)
+            hidden = rnn:updateOutput(output)
+            output = gen:updateOutput(hidden)
             self.output[step]:copy(output)
          end
       else
-      
+         error"Not Implemented"
          self.tableoutput[1] = nn.rnn.recursiveCopy(
             self.tableoutput[1] or table.remove(self._output, 1), 
-            self.module:updateOutput(output)
+            self.modules[1]:updateOutput(output)
          )
          
          -- generate
          for step=2,self.ngen do
             self.tableoutput[step] = nn.rnn.recursiveCopy(
                self.tableoutput[step] or table.remove(self._output, 1), 
-               self.module:updateOutput(output)
+               self.modules[1]:updateOutput(output)
             )
          end
          
@@ -139,21 +156,27 @@ function SequenceGenerator:updateGradInput(input, gradOutput)
       seqlen = #input
    end
    
+   local rnn, gen = unpack(self.modules)
+   
    -- back-propagate through time
-   for step=self.ngen,2,-1 do
-      self.module:updateGradInput(self.output[step-1], gradOutput[step])
+   self.gradHidden = {}
+   for step=self.ngen,1,-1 do
+      self.gradHidden[step] = gen:updateGradInput(self.hidden[step], gradOutput[step])
+      if step > 1 then
+         rnn:updateGradInput(self.output[step-1], self.gradHidden[step])
+      end
    end
    
    self.tablegradinput = {}
-   self.tablegradinput[seqlen] = self.module:updateGradInput(input[seqlen], gradOutput[1])
+   self.tablegradinput[seqlen] = rnn:updateGradInput(input[seqlen], self.gradHidden[1])
    
    if seqlen > 1 then
-      self._gradZero = self._gradZero or gradOutput.new()
-      self._gradZero:resizeAs(gradOutput[1]):zero()
+      self._gradZero = self._gradZero or self.gradHidden[1].new()
+      self._gradZero:resizeAs(self.gradHidden[1]):zero()
    end
    
    for step=seqlen-1,1,-1 do
-      self.tablegradinput[step] = self.module:updateGradInput(input[step], self._gradZero)
+      self.tablegradinput[step] = rnn:updateGradInput(input[step], self._gradZero)
    end
    
    if torch.isTensor(input) then
@@ -181,16 +204,22 @@ function SequenceGenerator:accGradParameters(input, gradOutput, scale)
       seqlen = #input
    end
    
-   -- back-propagate through time 
-   for step=self.ngen,2,-1 do
-      self.module:accGradParameters(self.output[step-1], gradOutput[step], scale)
-   end   
+   local rnn, gen = unpack(self.modules)
    
-   self.module:accGradParameters(input[seqlen], gradOutput[1], scale)
+   -- back-propagate through time
+   for step=self.ngen,1,-1 do
+      gen:accGradParameters(self.hidden[step], gradOutput[step], scale)
+      if step > 1 then
+         rnn:accGradParameters(self.output[step-1], self.gradHidden[step], scale)
+      end
+   end
+   
+   rnn:accGradParameters(input[seqlen], self.gradHidden[1], scale)
    
    for step=seqlen-1,1,-1 do
-      self.module:accGradParameters(input[step], self._gradZero, scale)
+      rnn:accGradParameters(input[step], self._gradZero, scale)
    end
+   
 end
 
 function SequenceGenerator:accUpdateGradParameters(inputTable, gradOutputTable, lr)
@@ -204,6 +233,7 @@ end
 -- 'both' affects both training and evaluation (recommended for LSTMs)
 -- Essentially, forget() isn't called on rnn module when remember is on
 function SequenceGenerator:remember(remember)
+   assert(remember and remember == 'neither', "Only supports 'neither' for now")
    self._remember = (remember == nil) and 'both' or remember
    local _ = require 'moses'
    assert(_.contains({'both','eval','train','neither'}, self._remember), 
@@ -219,6 +249,8 @@ function SequenceGenerator:training()
       self._output = {}
       -- empty output table (tensor mem was managed by seq)
       self.tableoutput = nil
+      self.hidden = nil
+      self.gradHidden = nil
    end
    parent.training(self)
 end
@@ -229,6 +261,8 @@ function SequenceGenerator:evaluate()
       self:forget()
       -- empty output table (tensor mem was managed by rnn)
       self.tableoutput = {}
+      self.hidden = nil
+      self.gradHidden = nil
    end
    parent.evaluate(self)
    assert(self.train == false)
@@ -244,8 +278,23 @@ function SequenceGenerator:clearState()
    end
    self._output = {}
    self.tableoutput = {}
+   self.hidden = {}
+   self.gradHidden = {}
    self.tablegradinput = {}
-   self.module:clearState()
+   self.modules[1]:clearState()
+   self.modules[2]:clearState()
 end
 
-SequenceGenerator.__tostring__ = nn.Decorator.__tostring__
+function SequenceGenerator:__tostring__()
+   local tab = '  '
+   local line = '\n'
+   local ext = '  |    '
+   local extlast = '       '
+   local last = '   ... -> '
+   local str = torch.type(self)
+   str = str .. ' {'
+   str = str .. line .. tab .. 'rnn : ' .. tostring(self.modules[1]):gsub(line, line .. tab .. ext)
+   str = str .. line .. tab .. 'gen     : ' .. tostring(self.modules[2]):gsub(line, line .. tab .. ext)
+   str = str .. line .. '}'
+   return str
+end

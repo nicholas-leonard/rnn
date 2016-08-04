@@ -1013,7 +1013,7 @@ A complete implementation of Ref. A is available [here](examples/recurrent-visua
 ## SequenceGenerator ##
 
 ```lua
-seqgen = nn.SequenceGenerator(rnn, ngen)
+seqgen = nn.SequenceGenerator(rnn, gen, ngen)
 ``` 
 An [AbstractSequencer](#rnn.AbstractSequencer) subclass, the `SequenceGenerator` can be used to recursively generate sequences.
 Suppose you have an `rnn` (an [AbstractRecurrent](#rnn.AbstractRecurrent) subclass) for which you want to feed in a 

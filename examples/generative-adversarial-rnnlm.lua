@@ -13,10 +13,10 @@ math.log10 = function(x) return math.log(x, 10) end
 
 --[[
 TODO
-feed condition into D()
 std reward
 D() reward at each time-step
-reduce discriminator capacity
+
+seqgen shouldn't receive gradients for LSRC on conditions
 
 issue:
 generator gets stuck in local minima by REINFORCE
