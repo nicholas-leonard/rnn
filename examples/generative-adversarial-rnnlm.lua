@@ -47,7 +47,6 @@ cmd:option('--silent', false, 'don\'t print anything to stdout')
 -- rnn
 cmd:option('--xplogpath', '', 'path to the pretrained RNNLM that is used to initialize the GAN')
 cmd:option('--nsample', 50, 'how may words w[t+1] to sample from the bigram distribution given w[t]')
-cmd:option('--ngen', 50, 'number of words generated per update')
 cmd:option('--dhiddensize', '{}', 'table of discriminator hidden sizes')
 cmd:option('--evalfreq', 10, 'how many updates between evaluations')
 cmd:option('--updatelookup', false, 'set to true to enable lookup table updates')
@@ -56,8 +55,13 @@ cmd:option('--rewardscale', 1, 'the scale of the reward.')
 cmd:option('--fixgen', false, 'fix the generator (dont let it learn)')
 cmd:option('--epsilon', 0, 'epsilon greedy value defaults to 0.1/nsample')
 cmd:option('--savefreq', 3, 'save model every savefreq epochs')
-cmd:option('--traincond', false, 'use the training set to condition the G(z), i.e. z~P_data(x)')
 cmd:option('--smoothtarget', false, 'discriminator targets are 0.1 and 0.9 instead of 0 and 1')
+cmd:option('--ncond', 3, 'number of words used to condition the generator i.e. seqlen of z')
+cmd:option('--ngen', 8, 'number of generated words per sequence. ')
+cmd:option('--stepgen', 2, 'number of generated words to add when mindacc is reached')
+cmd:option('--seqlen', 100, 'maximum sequence length where seqlen = ncond + ngen - 1')
+cmd:option('--pgen', 0.8, 'probability of training generator instead of discriminator')
+cmd:option('--mindacc', 0.6, 'min accuracy for D(x). When reached, the ngen is increased by stepgen')
 -- data
 cmd:option('--batchsize', 32, 'number of examples per batch')
 cmd:option('--trainsize', -1, 'number of train examples seen between each epoch')
@@ -71,7 +75,7 @@ opt.dhiddensize = loadstring(" return "..opt.dhiddensize)()
 opt.schedule = loadstring(" return "..opt.schedule)()
 opt.inputsize = opt.inputsize == -1 and opt.hiddensize[1] or opt.inputsize
 opt.id = opt.id == '' and ('ptb' .. ':' .. dl.uniqueid()) or opt.id
-opt.version = 5 -- SequenceGenerator(rnn, ngen) -> SequenceGenerator(rnn, gen, ngen)
+opt.version = 6 -- pgen is a hyper-parameters (to give an advantage to generator)
 opt.epsilon = opt.epsilon == -1 and 0.1/opt.nsample or opt.epsilon
 if not opt.silent then
    table.print(opt)
@@ -262,30 +266,26 @@ end
 --[[ training loop ]]--
 
 -- Pg(z) is the unigram distribution
+--[[
 trainset.unigram = torch.Tensor(#trainset.ivocab)
 for i,word in ipairs(trainset.ivocab) do
    trainset.unigram[i] = trainset.wordfreq[word]
 end
 trainset.unigram:div(trainset.unigram:sum())
-local Pgen = torch.AliasMultinomial(trainset.unigram)
+local Pgen = torch.AliasMultinomial(trainset.unigram)--]]
 local z = torch.LongTensor(1, opt.batchsize)
 
 -- z ~ Pg(z) : sample some words to condition the generator
 local function drawPgen(z)
-   if opt.traincond then
-      opt.ncond = opt.ncond > 0 and opt.ncond or opt.ngen
-      local cond = trainset.data:narrow(1, math.random(1, trainset:size(1)-opt.ncond), opt.ncond)
-      z:resize(opt.ncond, opt.batchsize):copy(cond)
-      seqgen.ngen = opt.ngen-opt.ncond+1
-   else
-      z = Pgen:batchdraw(z)
-   end
+   local cond = trainset.data:narrow(1, math.random(1, trainset:size(1)-opt.ncond), opt.ncond)
+   z:resize(opt.ncond, opt.batchsize):copy(cond)
+   seqgen.ngen = opt.ngen
+   -- used to be : z = Pgen:batchdraw(z)
    return z
 end
 
 local epoch = 1
-local evalcount = 0 
-local p_train_gen = 0.5 -- prob of training generator instead of discriminator
+local evalcount = 0
 
 opt.lr = opt.startlr
 opt.trainsize = opt.trainsize == -1 and trainset:size() or opt.trainsize
@@ -301,9 +301,9 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    local dg_count, d_count, g_count = 0, 0, 0
    local cm = optim.ConfusionMatrix{0,1}
    
-   for i, inputs, targets in trainset:subiter(opt.ngen+1, opt.trainsize) do -- x ~ Pdata(x)
+   for i, inputs, targets in trainset:subiter(opt.ncond+opt.ngen-1, opt.trainsize) do -- x ~ Pdata(x)
       
-      if opt.fixgen or evalcount <= 0 or math.random() > p_train_gen then
+      if math.random() > opt.pgen then
          -- train or evaluate discriminator D()
          
          z = drawPgen(z)
@@ -321,61 +321,49 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          dg_net:forget()
          local dg_output = dg_net:forward(d_input)
          
-         d_target:resize(opt.batchsize):fill(opt.smoothtarget and 0.1 or 0)
-         local dg_err = d_criterion:forward(dg_output, d_target)
+         d_target:resize(opt.batchsize):fill(0)
+         cm:batchAddBCE(dg_output, d_target)
          
-         if evalcount <= 0 then
-            d_target:fill(0)
-            cm:batchAddBCE(dg_output, d_target)
-         else
-            sum_dg_err = sum_dg_err + dg_err
-            dg_count = dg_count + 1
-            
-            local gradOutput = d_criterion:backward(dg_output, d_target)
-            dg_net:zeroGradParameters()
-            dg_net:doBackward()
-            dg_net:backward(d_input, gradOutput)
-         end
+         d_target:fill(opt.smoothtarget and 0.1 or 0)
+         local dg_err = d_criterion:forward(dg_output, d_target)
+         sum_dg_err = sum_dg_err + dg_err
+         dg_count = dg_count + 1
+         
+         local gradOutput = d_criterion:backward(dg_output, d_target)
+         dg_net:zeroGradParameters()
+         dg_net:doBackward()
+         dg_net:backward(d_input, gradOutput)
          
          -- D(x) : forward/backward x through discriminator network
          local d_output = d_net:forward(inputs)
          
+         d_target:fill(1)
+         cm:batchAddBCE(d_output, d_target)
+      
          d_target:fill(opt.smoothtarget and 0.9 or 1)
          local d_err = d_criterion:forward(d_output, d_target)
+         sum_d_err = sum_d_err + d_err
+         d_count = d_count + 1
          
+         -- backward D(x)
+         local gradOutput = d_criterion:backward(d_output, d_target)
+         d_net:backward(inputs, gradOutput)
          
-         if evalcount <= 0 then
-            d_target:fill(1)
-            cm:batchAddBCE(d_output, d_target)
-            evalcount = opt.evalfreq + 1
-            cm:updateValids()
-            -- prob of training G() instead of D() is proportional to train accuracy
-            p_train_gen = 2*math.max(0, cm.totalValid - 0.5)
-         else
-            sum_d_err = sum_d_err + d_err
-            d_count = d_count + 1
-            
-            -- backward D(x)
-            local gradOutput = d_criterion:backward(d_output, d_target)
-            d_net:backward(inputs, gradOutput)
-            
-            -- update D(x) and D(G(z))
-            if opt.cutoff > 0 then
-               d_net:gradParamClip(opt.cutoff)
+         -- update D(x) and D(G(z))
+         if opt.cutoff > 0 then
+            d_net:gradParamClip(opt.cutoff)
+         end
+         d_net:updateGradParameters(opt.momentum)
+         d_net:updateParameters(opt.lr)
+         
+         if not tested_grad_d then
+            local p, gp = d_net:parameters()
+            local p2, gp2 = dg_net:parameters()
+            for i=1,#p do
+               assert(math.abs(p[i]:sum() - p2[i]:sum()) < 0.000001)
+               assert(math.abs(gp[i]:sum() - gp2[i]:sum()) < 0.000001)
             end
-            d_net:updateGradParameters(opt.momentum)
-            d_net:updateParameters(opt.lr)
-            
-            if not tested_grad_d then
-               local p, gp = d_net:parameters()
-               local p2, gp2 = dg_net:parameters()
-               for i=1,#p do
-                  assert(math.abs(p[i]:sum() - p2[i]:sum()) < 0.000001)
-                  assert(math.abs(gp[i]:sum() - gp2[i]:sum()) < 0.000001)
-               end
-               print"TESTED"
-               tested_grad_d = true
-            end
+            tested_grad_d = true
          end
          
       else
@@ -461,7 +449,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
       evalcount = evalcount - 1
 
       if opt.progress then
-         xlua.progress(math.min(i + opt.ngen + 1, opt.trainsize), opt.trainsize)
+         xlua.progress(math.min(i + opt.ncond + opt.ngen - 1, opt.trainsize), opt.trainsize)
       end
 
       if i % 1000 == 0 then
@@ -479,7 +467,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    opt.lr = math.max(opt.minlr, opt.lr)
    
    if not opt.silent then
-      print("Learning rate="..opt.lr.."; ngen="..opt.ngen-opt.ncond+1)
+      print("Learning rate="..opt.lr.."; ngen="..opt.ngen)
    end
 
    if cutorch then cutorch.synchronize() end
@@ -497,9 +485,9 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    xplog.accuracy[epoch] = cm.totalValid
    xplog.confusion[epoch] = cm
    
-   if opt.ncond and cm.totalValid < 0.6 then
-      opt.ncond = math.max(1, opt.ncond - 1)
-      print("Decreasing size of condition z to "..opt.ncond)
+   if cm.totalValid < opt.mindacc then
+      opt.ngen = math.min(opt.seqlen, opt.ngen+opt.stepgen)
+      print("New ngen="..opt.ngen)
    end
    -- draw a sample
    g_net:evaluate()
