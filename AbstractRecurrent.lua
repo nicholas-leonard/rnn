@@ -228,7 +228,6 @@ AbstractRecurrent.recursiveTensorEq = rnn.recursiveTensorEq
 AbstractRecurrent.recursiveNormal = rnn.recursiveNormal
 
 
-
 function AbstractRecurrent:backwardThroughTime(step, rho)
    error"DEPRECATED Jan 8, 2016"
 end

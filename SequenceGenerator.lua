@@ -171,8 +171,8 @@ function SequenceGenerator:updateGradInput(input, gradOutput)
    self.tablegradinput[seqlen] = rnn:updateGradInput(input[seqlen], self.gradHidden[1])
    
    if seqlen > 1 then
-      self._gradZero = self._gradZero or self.gradHidden[1].new()
-      self._gradZero:resizeAs(self.gradHidden[1]):zero()
+      self._gradZero = nn.rnn.recursiveResizeAs(self._gradZero, self.gradHidden[1])
+      nn.rnn.recursiveFill(self._gradZero, 0)
    end
    
    for step=seqlen-1,1,-1 do
@@ -294,7 +294,7 @@ function SequenceGenerator:__tostring__()
    local str = torch.type(self)
    str = str .. ' {'
    str = str .. line .. tab .. 'rnn : ' .. tostring(self.modules[1]):gsub(line, line .. tab .. ext)
-   str = str .. line .. tab .. 'gen     : ' .. tostring(self.modules[2]):gsub(line, line .. tab .. ext)
+   str = str .. line .. tab .. 'gen : ' .. tostring(self.modules[2]):gsub(line, line .. tab .. ext)
    str = str .. line .. '}'
    return str
 end

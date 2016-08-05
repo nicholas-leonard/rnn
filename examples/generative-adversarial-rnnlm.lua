@@ -42,10 +42,8 @@ cmd:option('--cutoff', -1, 'max l2-norm of concatenation of all gradParam tensor
 cmd:option('--cuda', false, 'use CUDA')
 cmd:option('--device', 1, 'sets the device (GPU) to use')
 cmd:option('--maxepoch', 1000, 'maximum number of epochs to run')
-cmd:option('--earlystop', 50, 'maximum number of epochs to wait to find a better local minima for early-stopping')
 cmd:option('--progress', false, 'print progress bar')
 cmd:option('--silent', false, 'don\'t print anything to stdout')
-cmd:option('--uniform', 0.1, 'initialize parameters using uniform distribution between -uniform and uniform. -1 means default initialization')
 -- rnn
 cmd:option('--xplogpath', '', 'path to the pretrained RNNLM that is used to initialize the GAN')
 cmd:option('--nsample', 50, 'how may words w[t+1] to sample from the bigram distribution given w[t]')
@@ -73,7 +71,7 @@ opt.dhiddensize = loadstring(" return "..opt.dhiddensize)()
 opt.schedule = loadstring(" return "..opt.schedule)()
 opt.inputsize = opt.inputsize == -1 and opt.hiddensize[1] or opt.inputsize
 opt.id = opt.id == '' and ('ptb' .. ':' .. dl.uniqueid()) or opt.id
-opt.version = 4 -- trainset is used as z; disc. sees cond and gen: D(z..G(z))
+opt.version = 5 -- SequenceGenerator(rnn, ngen) -> SequenceGenerator(rnn, gen, ngen)
 opt.epsilon = opt.epsilon == -1 and 0.1/opt.nsample or opt.epsilon
 if not opt.silent then
    table.print(opt)
@@ -99,10 +97,6 @@ end
 local xplog = torch.load(opt.xplogpath)
 assert(xplog.dataset == 'PennTreeBank', "GAN-RNNLM currently only supports LMs trained with recurrent-language-model.lua script")
 local lm = torch.type(xplog.model) == 'nn.Serial' and xplog.model.modules[1] or xplog.model
-
-print("Loaded language model")
-print(lm)
-print""
 
 -- clear all sharedClones
 lm:clearStepModules()
@@ -158,11 +152,9 @@ if opt.cuda then
    bigram = nn.DontCast(bigram, true, true, 'torch.LongTensor')
 end
 
-gsm = nn.Sequential()
-   :add(nn.ConcatTable():add(gsm):add(bigram))
-   :add(lsrc)
+gsm = nn.ConcatTable():add(gsm):add(bigram)
 
-local seqgen = nn.SequenceGenerator(gsm, opt.ngen)
+local seqgen = nn.SequenceGenerator(gsm, lsrc, opt.ngen)
 local g_net = nn.Sequential() -- G(z)
    :add(nn.Convert())
    :add(seqgen)
@@ -281,7 +273,7 @@ local z = torch.LongTensor(1, opt.batchsize)
 -- z ~ Pg(z) : sample some words to condition the generator
 local function drawPgen(z)
    if opt.traincond then
-      opt.ncond = opt.ncond or opt.ngen
+      opt.ncond = opt.ncond > 0 and opt.ncond or opt.ngen
       local cond = trainset.data:narrow(1, math.random(1, trainset:size(1)-opt.ncond), opt.ncond)
       z:resize(opt.ncond, opt.batchsize):copy(cond)
       seqgen.ngen = opt.ngen-opt.ncond+1
@@ -487,7 +479,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    opt.lr = math.max(opt.minlr, opt.lr)
    
    if not opt.silent then
-      print("learning rate", opt.lr)
+      print("Learning rate="..opt.lr.."; ngen="..opt.ngen-opt.ncond+1)
    end
 
    if cutorch then cutorch.synchronize() end

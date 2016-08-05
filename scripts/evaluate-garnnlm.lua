@@ -13,13 +13,10 @@ cmd:option('--xplogpath', '', 'path to a previously saved xplog containing model
 cmd:option('--cuda', false, 'model was saved with cuda')
 cmd:option('--device', 1, 'which GPU device to use')
 cmd:option('--nsample', 100, 'sample this many words from the language model')
-cmd:option('--temperature', 1, 'temperature of multinomial. Increase to sample wildly, reduce to be more deterministic.')
 cmd:option('--dumpcsv', false, 'dump training and validation error to CSV file')
 cmd:option('--given', '<eos>', 'token to condition generator on')
 cmd:text()
 local opt = cmd:parse(arg or {})
-
-assert(opt.temperature > 0)
 
 -- check that saved model exists
 assert(paths.filep(opt.xplogpath), opt.xplogpath..' does not exist')
@@ -30,7 +27,7 @@ if opt.cuda then
 end
 
 local xplog = torch.load(opt.xplogpath)
-local lm = xplog.g_net
+local lm = xplog.g_net.module
 
 print("Hyper-parameters (xplog.opt):")
 print(xplog.opt)
@@ -69,6 +66,8 @@ print(lm)
 lm:forget()
 lm:evaluate()
 
+seqgen = lm:findModules('nn.SequenceGenerator')
+seqgen[1].ngen = opt.nsample
 
 local sampletext = {}
 local prevword = assert(trainset.vocab[opt.given], "Unknown token : "..opt.given)
