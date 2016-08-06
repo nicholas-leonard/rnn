@@ -86,6 +86,8 @@ cmd:option('--stepgen', 2, 'number of generated words to add when mindacc is rea
 cmd:option('--seqlen', 100, 'maximum sequence length where seqlen = ncond + ngen - 1')
 cmd:option('--pgen', 0.8, 'probability of training generator instead of discriminator')
 cmd:option('--mindacc', 0.6, 'min accuracy for D(x). When reached, the ngen is increased by stepgen')
+cmd:option('--lessdcap', false, 'use less capacity in the discriminator')
+cmd:option('--posreinforce', false, 'only reinforce positively')
 -- data
 cmd:option('--batchsize', 32, 'number of examples per batch')
 cmd:option('--trainsize', -1, 'number of train examples seen between each epoch')
@@ -99,7 +101,7 @@ opt.dhiddensize = loadstring(" return "..opt.dhiddensize)()
 opt.schedule = loadstring(" return "..opt.schedule)()
 opt.inputsize = opt.inputsize == -1 and opt.hiddensize[1] or opt.inputsize
 opt.id = opt.id == '' and ('ptb' .. ':' .. dl.uniqueid()) or opt.id
-opt.version = 7 -- bigram samples without replacement
+opt.version = 8 -- #x == #z (was #x+1 = #z)
 opt.epsilon = opt.epsilon == -1 and 0.1/opt.nsample or opt.epsilon
 if not opt.silent then
    table.print(opt)
@@ -193,7 +195,7 @@ print""
 --[[ discriminator network : D(x) ]]--
 
 
-local dsm = stepmodule:clone() -- the rnns layers of g_net and d_net are not shared
+local dsm = opt.lessdcap and nn.Sequential():add(stepmodule:get(1):clone()) or stepmodule:clone() -- the rnns layers of g_net and d_net are not shared
 if lm:get(2) == 'nn.Dropout' then
    table.insert(dsm.modules, 1, nn.Dropout())
 end
@@ -324,7 +326,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    local dg_count, d_count, g_count = 0, 0, 0
    local cm = optim.ConfusionMatrix{0,1}
    
-   for i, inputs, targets in trainset:subiter(opt.ncond+opt.ngen-1, opt.trainsize) do -- x ~ Pdata(x)
+   for i, inputs, targets in trainset:subiter(opt.ncond+opt.ngen, opt.trainsize) do -- x ~ Pdata(x)
       
       if math.random() > opt.pgen then
          -- train or evaluate discriminator D()
@@ -339,6 +341,10 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          d_input:resize(g_output:size(1)+z:size(1), opt.batchsize)
          d_input:narrow(1,1,z:size(1)):copy(z)
          d_input:narrow(1,z:size(1)+1,g_output:size(1)):copy(g_output)
+         
+         if i < 1000 then
+            assert(d_input:size(1) == inputs:size(1))
+         end
          
          dg_net:training()
          dg_net:forget()
@@ -427,6 +433,11 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
             xplog.mse.vrReward:resizeAs(xplog.mse.reward):copy(xplog.mse.reward)
             xplog.mse.vrReward:add(-1, br)
             xplog.mse.vrReward:div(opt.batchsize)
+            if opt.posreinforce then
+               pr = pr or xplog.mse.vrReward.new()
+               pr:gt(xplog.mse.vrReward, 0)
+               xplog.mse.vrReward:cmul(pr)
+            end
             
             -- broadcast reward to modules
             g_net:reinforce(xplog.mse.vrReward)  
@@ -443,6 +454,9 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          else
             -- reward=1 for classifying gen. sample. as training data
             d_target:fill(1) 
+            if opt.posreinforce then
+               br:zero() -- when baseline=0, reward is 0 or 1
+            end
             g_err = g_criterion:forward({dg_output, br}, d_target) 
             gradOutput = g_criterion:backward({dg_output, br}, d_target)
          end
@@ -472,7 +486,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
       evalcount = evalcount - 1
 
       if opt.progress then
-         xlua.progress(math.min(i + opt.ncond + opt.ngen - 1, opt.trainsize), opt.trainsize)
+         xlua.progress(math.min(i + opt.ncond + opt.ngen, opt.trainsize), opt.trainsize)
       end
 
       if i % 1000 == 0 then
