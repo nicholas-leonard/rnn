@@ -421,7 +421,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          
          dv_net:evaluate()
          local dv_output = dv_net:forward(v_input)
-         if dv_output:mean() < 0 then
+         if dv_output:mean() < 0.5 then
             -- if the validation batch is classified as generated samples then
             -- we undo the update to the discriminator
             d_net:updateParameters(-opt.lr)
