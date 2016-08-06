@@ -15,6 +15,7 @@ cmd:option('--device', 1, 'which GPU device to use')
 cmd:option('--nsample', 100, 'sample this many words from the language model')
 cmd:option('--dumpcsv', false, 'dump training and validation error to CSV file')
 cmd:option('--given', '<eos>', 'token to condition generator on')
+cmd:option('--dtest', false, 'test discriminator to see how sensitive it is to small perturbations in the training set samples')
 cmd:text()
 local opt = cmd:parse(arg or {})
 
@@ -27,7 +28,8 @@ if opt.cuda then
 end
 
 local xplog = torch.load(opt.xplogpath)
-local lm = xplog.g_net.module
+local g_net = xplog.g_net.module
+local d_net = xplog.d_net.module
 
 print("Hyper-parameters (xplog.opt):")
 print(xplog.opt)
@@ -61,25 +63,47 @@ if xplog.dataset == 'PennTreeBank' then
    assert(trainset.vocab['the'] == xplog.vocab['the'])
 end
 
-print(lm)
+math.log10 = function(x) return math.log(x, 10) end
 
-lm:forget()
-lm:evaluate()
+if opt.dtest then
+   print(d_net)
+   local cm = xplog.confusion[1]
+   function optim.ConfusionMatrix:batchAddBCE(predictions, targets)
+      self._bcepred = self._bcepred or predictions.new()
+      self._bcepred:gt(predictions, 0.5):add(1)
+      self._bcetarg = self._bcetarg or targets.new()
+      self._bcetarg:add(targets, 1)
+      return self:batchAdd(self._bcepred, self._bcetarg)
+   end
+   cm:zero()
+   local d_target = torch.CudaTensor(xplog.opt.batchsize)
+   for i, input, target in testset:subiter(xplog.opt.ngen+xplog.opt.ncond) do
+      local output = d_net:forward(input)
+      d_target:fill(1)
+      cm:batchAddBCE(output, d_target)
+   end
+   print(cm)
+else
+   print(g_net)
 
-seqgen = lm:findModules('nn.SequenceGenerator')
-seqgen[1].ngen = opt.nsample
+   g_net:forget()
+   g_net:evaluate()
 
-local sampletext = {}
-local prevword = assert(trainset.vocab[opt.given], "Unknown token : "..opt.given)
-assert(prevword)
-local inputs = torch.LongTensor(1,1) -- seqlen x batchsize
-inputs[{1,1}] = prevword
-if opt.cuda then inputs = inputs:cuda() end
-local output = lm:forward(inputs)
+   seqgen = g_net:findModules('nn.SequenceGenerator')
+   seqgen[1].ngen = opt.nsample
 
-for i=1,output:size(1) do
-   local sample = output[i][1]
-   local currentword = trainset.ivocab[sample]
-   table.insert(sampletext, currentword)
+   local sampletext = {}
+   local prevword = assert(trainset.vocab[opt.given], "Unknown token : "..opt.given)
+   assert(prevword)
+   local inputs = torch.LongTensor(1,1) -- seqlen x batchsize
+   inputs[{1,1}] = prevword
+   if opt.cuda then inputs = inputs:cuda() end
+   local output = g_net:forward(inputs)
+
+   for i=1,output:size(1) do
+      local sample = output[i][1]
+      local currentword = trainset.ivocab[sample]
+      table.insert(sampletext, currentword)
+   end
+   print(table.concat(sampletext, ' '))
 end
-print(table.concat(sampletext, ' '))

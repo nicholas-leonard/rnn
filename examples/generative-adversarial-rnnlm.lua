@@ -20,15 +20,31 @@ seqgen shouldn't receive gradients for LSRC on conditions
 
 issue:
 generator gets stuck in local minima by REINFORCE
+generator never learns to best the discriminator
+is it possible that the discriminator overfits such that only x from the training set are accepted?
+lets test how sensitive the discriminator is to small perturbations in the distribution (evaluate-garnnlm --dtest)
+This is the confusion matrix of a 100% accuracy (train vs gen) discriminator on the validation set:
+ConfusionMatrix:
+[       0       0]   -nan%     [class: 0]
+ [    7277     217]  2.896%    [class: 1]
+ + average row correct: 2.895649895072% 
+ + average rowUcol correct (VOC measure): 2.895649895072% 
+ + global correct: 2.8956498532159%
+So basically, 97% of the validation set is classified as generated samples!!!!!!!!!!!!!!
+This means that the discriminator is overfitting the training set
+In such a case, the generator can only win by learning to generate the training set exactly
+This isn't what we want the generator to learn.
+
+solution:
+reduce discriminator capacity
+early-stop discriminator on validation set vs gen accuracy
 
 failed solutions:
 e-greedy, temperature, train LM
 condition on trainset samples
 decrease size of training set samples when generator gets better.
+sample without replacement:the bigram currently draws from multinomial with replacement, which introduces duplicates and conflicting gradients
 
-solution 1: sample without replacement
-
-the bigram samples with replacement
 
 solution 2: element-wise D(X) 
 
@@ -88,6 +104,7 @@ cmd:option('--pgen', 0.8, 'probability of training generator instead of discrimi
 cmd:option('--mindacc', 0.6, 'min accuracy for D(x). When reached, the ngen is increased by stepgen')
 cmd:option('--lessdcap', false, 'use less capacity in the discriminator')
 cmd:option('--posreinforce', false, 'only reinforce positively')
+cmd:option('--drnn', false, 'the discriminator is a simple rnn')
 -- data
 cmd:option('--batchsize', 32, 'number of examples per batch')
 cmd:option('--trainsize', -1, 'number of train examples seen between each epoch')
@@ -101,7 +118,7 @@ opt.dhiddensize = loadstring(" return "..opt.dhiddensize)()
 opt.schedule = loadstring(" return "..opt.schedule)()
 opt.inputsize = opt.inputsize == -1 and opt.hiddensize[1] or opt.inputsize
 opt.id = opt.id == '' and ('ptb' .. ':' .. dl.uniqueid()) or opt.id
-opt.version = 8 -- #x == #z (was #x+1 = #z)
+opt.version = 9 -- discriminator is only updated if validation batch is classified as training data
 opt.epsilon = opt.epsilon == -1 and 0.1/opt.nsample or opt.epsilon
 if not opt.silent then
    table.print(opt)
@@ -114,7 +131,8 @@ end
 
 --[[ data set ]]--
 
-local trainset, validset, testset = dl.loadPTB({opt.batchsize,1,1})
+local trainset, validset, testset = dl.loadPTB({opt.batchsize,opt.batchsize,1})
+assert(validset)
 if not opt.silent then 
    print("Vocabulary size : "..#trainset.ivocab) 
    print("Train set split into "..opt.batchsize.." sequences of length "..trainset:size())
@@ -238,6 +256,8 @@ function dg_net:dontBackward()
    self.accGradParameters = function() end
 end
    
+local dv_net = d_net:sharedClone() -- discriminator for validation set samples D(v)
+
 --[[ loss function ]]--
 
 local g_criterion = nn.BinaryClassReward(g_net, opt.rewardscale)
@@ -275,7 +295,7 @@ xplog.basereward = basereward
 xplog.d_criterion, xplog.g_criterion = d_criterion, g_criterion
 -- keep a log of error for each epoch
 xplog.dgerr, xplog.derr, xplog.gerr = {}, {}, {}
-xplog.accuracy, xplog.confusion = {}, {}
+xplog.accuracy, xplog.confusion, xplog.vconfusion = {}, {}, {}
 xplog.epoch = 0
 paths.mkdir(opt.savepath)
 
@@ -310,7 +330,6 @@ local function drawPgen(z)
 end
 
 local epoch = 1
-local evalcount = 0
 
 opt.lr = opt.startlr
 opt.trainsize = opt.trainsize == -1 and trainset:size() or opt.trainsize
@@ -325,11 +344,12 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    local sum_dg_err, sum_d_err, sum_g_err = 0.0000001, 0.0000001, 0.0000001
    local dg_count, d_count, g_count = 0, 0, 0
    local cm = optim.ConfusionMatrix{0,1}
+   local cmv = optim.ConfusionMatrix{0,1}
    
    for i, inputs, targets in trainset:subiter(opt.ncond+opt.ngen, opt.trainsize) do -- x ~ Pdata(x)
       
       if math.random() > opt.pgen then
-         -- train or evaluate discriminator D()
+         -- train discriminator D()
          
          z = drawPgen(z)
          
@@ -353,10 +373,10 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          d_target:resize(opt.batchsize):fill(0)
          cm:batchAddBCE(dg_output, d_target)
          
+         cmv:batchAddBCE(dg_output, d_target)
+         
          d_target:fill(opt.smoothtarget and 0.1 or 0)
          local dg_err = d_criterion:forward(dg_output, d_target)
-         sum_dg_err = sum_dg_err + dg_err
-         dg_count = dg_count + 1
          
          local gradOutput = d_criterion:backward(dg_output, d_target)
          dg_net:zeroGradParameters()
@@ -371,8 +391,6 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
       
          d_target:fill(opt.smoothtarget and 0.9 or 1)
          local d_err = d_criterion:forward(d_output, d_target)
-         sum_d_err = sum_d_err + d_err
-         d_count = d_count + 1
          
          -- backward D(x)
          local gradOutput = d_criterion:backward(d_output, d_target)
@@ -394,6 +412,28 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
             end
             tested_grad_d = true
          end
+         
+         -- cross-validation of the discriminator (so it doesn't overfit the training set)
+         
+         local seqlen = opt.ncond+opt.ngen
+         local stop = math.random(seqlen, validset:size(1))
+         v_input, v_target = validset:sub(stop-seqlen+1, stop, v_input, v_target)
+         
+         dv_net:evaluate()
+         local dv_output = dv_net:forward(v_input)
+         if dv_output:mean() < 0 then
+            -- if the validation batch is classified as generated samples then
+            -- we undo the update to the discriminator
+            d_net:updateParameters(-opt.lr)
+         else
+            sum_dg_err = sum_dg_err + dg_err
+            dg_count = dg_count + 1
+            sum_d_err = sum_d_err + d_err
+            d_count = d_count + 1
+         end
+         
+         d_target:fill(1)
+         cmv:batchAddBCE(dv_output, d_target)
          
       else
          -- train generator G(z)
@@ -482,8 +522,6 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          basereward:updateParameters(opt.lr)
          
       end
-      
-      evalcount = evalcount - 1
 
       if opt.progress then
          xlua.progress(math.min(i + opt.ncond + opt.ngen, opt.trainsize), opt.trainsize)
@@ -494,6 +532,8 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
       end
 
    end
+   
+   
    
    -- learning rate decay
    if opt.schedule then
@@ -519,8 +559,11 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    print(string.format("Reward: G(z)=%f; nupdate=%d", -xplog.gerr[epoch], g_count))
    
    print(cm)
+   print(cmv)
    xplog.accuracy[epoch] = cm.totalValid
    xplog.confusion[epoch] = cm
+   xplog.vconfusion[epoch] = vcm
+   
    
    if cm.totalValid < opt.mindacc then
       opt.ngen = math.min(opt.seqlen, opt.ngen+opt.stepgen)
