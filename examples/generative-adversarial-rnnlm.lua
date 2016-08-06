@@ -174,7 +174,6 @@ else
    bigram = nn.Bigrams(bigrams, opt.nsample, opt.epsilon)
    torch.save(opt.cachepath, bigram)
 end
-print("Mean bigram size: "..bigram:statistics())
 
 if opt.cuda then
    bigram = nn.DontCast(bigram, true, true, 'torch.LongTensor')
