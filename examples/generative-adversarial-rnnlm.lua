@@ -118,7 +118,7 @@ opt.dhiddensize = loadstring(" return "..opt.dhiddensize)()
 opt.schedule = loadstring(" return "..opt.schedule)()
 opt.inputsize = opt.inputsize == -1 and opt.hiddensize[1] or opt.inputsize
 opt.id = opt.id == '' and ('ptb' .. ':' .. dl.uniqueid()) or opt.id
-opt.version = 9 -- discriminator is only updated if validation batch is classified as training data
+opt.version = 10 -- if the validation batch output < training batch output then we undo the update to the discriminator
 opt.epsilon = opt.epsilon == -1 and 0.1/opt.nsample or opt.epsilon
 if not opt.silent then
    table.print(opt)
@@ -342,7 +342,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    d_net:training()
    g_net:training()
    local sum_dg_err, sum_d_err, sum_g_err = 0.0000001, 0.0000001, 0.0000001
-   local dg_count, d_count, g_count = 0, 0, 0
+   local dg_count, d_count, g_count, v_count = 0, 0, 0, 0
    local cm = optim.ConfusionMatrix{0,1}
    local cmv = optim.ConfusionMatrix{0,1}
    
@@ -388,6 +388,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          
          d_target:fill(1)
          cm:batchAddBCE(d_output, d_target)
+         local d_acc = d_output:mean()
       
          d_target:fill(opt.smoothtarget and 0.9 or 1)
          local d_err = d_criterion:forward(d_output, d_target)
@@ -421,10 +422,11 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
          
          dv_net:evaluate()
          local dv_output = dv_net:forward(v_input)
-         if dv_output:mean() < 0.5 then
-            -- if the validation batch is classified as generated samples then
+         if dv_output:mean() < d_acc then
+            -- if the validation batch output < training batch output then
             -- we undo the update to the discriminator
             d_net:updateParameters(-opt.lr)
+            v_count = v_count + 1
          else
             sum_dg_err = sum_dg_err + dg_err
             dg_count = dg_count + 1
@@ -555,7 +557,7 @@ while opt.maxepoch <= 0 or epoch <= opt.maxepoch do
    xplog.dgerr[epoch] = sum_dg_err/dg_count
    xplog.derr[epoch] = sum_d_err/d_count
    xplog.gerr[epoch] = sum_g_err/g_count
-   print(string.format("Loss: D(x)=%f, D(G(z))=%f; nupdate=%d", xplog.derr[epoch], xplog.dgerr[epoch], dg_count))
+   print(string.format("Loss: D(x)=%f, D(G(z))=%f; nupdate=%d, ncancel=%d", xplog.derr[epoch], xplog.dgerr[epoch], dg_count, v_count))
    print(string.format("Reward: G(z)=%f; nupdate=%d", -xplog.gerr[epoch], g_count))
    
    print(cm)
