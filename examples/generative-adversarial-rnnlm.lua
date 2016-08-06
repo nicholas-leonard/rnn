@@ -20,11 +20,35 @@ seqgen shouldn't receive gradients for LSRC on conditions
 
 issue:
 generator gets stuck in local minima by REINFORCE
-solutions:
+
+failed solutions:
 e-greedy, temperature, train LM
 condition on trainset samples
 decrease size of training set samples when generator gets better.
 
+solution 1: sample without replacement
+
+the bigram samples with replacement
+
+solution 2: element-wise D(X) 
+
+sample a training sample x
+sample a target mask m
+
+discriminator D(X) predicts if the particular sampled word is fake or generated.
+reward is generated per time-step
+
+MaskedGenerator
+input: x, m
+output: y (x:size(1) - 1)
+
+if mask=1: 
+samples w[t+1] (which is fed back in rnn in next recursion?  will learn to fix error)
+when generator is fooled at that time-step: REINFORCE
+
+if mask=0:
+samples the next word (hacks the REINFORCE).
+REINFORCE with reward of 1
 --]]
 
 --[[ command line arguments ]]--
@@ -75,7 +99,7 @@ opt.dhiddensize = loadstring(" return "..opt.dhiddensize)()
 opt.schedule = loadstring(" return "..opt.schedule)()
 opt.inputsize = opt.inputsize == -1 and opt.hiddensize[1] or opt.inputsize
 opt.id = opt.id == '' and ('ptb' .. ':' .. dl.uniqueid()) or opt.id
-opt.version = 6 -- pgen is a hyper-parameters (to give an advantage to generator)
+opt.version = 7 -- bigram samples without replacement
 opt.epsilon = opt.epsilon == -1 and 0.1/opt.nsample or opt.epsilon
 if not opt.silent then
    table.print(opt)
